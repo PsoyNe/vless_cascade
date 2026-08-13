@@ -191,31 +191,6 @@ chmod +x *.sh 2>/dev/null
 print_success "Все файлы скачаны и готовы к использованию"
 
 # ============================================================
-# НАСТРОЙКА CRON
-# ============================================================
-print_header "НАСТРОЙКА CRON"
-
-CRON_JOB="0 2 * * * /root/vless_checker/run_full_check.sh"
-
-# Проверяем, есть ли уже задание в cron
-if crontab -l 2>/dev/null | grep -q "vless_checker"; then
-    print_warning "Cron задание уже существует"
-    read -p "Перезаписать? (y/n): " -n 1 -r
-    echo ""
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        (crontab -l 2>/dev/null | grep -v "vless_checker"; echo "$CRON_JOB") | crontab -
-        print_success "Cron задание обновлено"
-    else
-        print_info "Cron задание оставлено без изменений"
-    fi
-else
-    (crontab -l 2>/dev/null; echo "$CRON_JOB") | crontab -
-    print_success "Cron задание добавлено"
-fi
-
-print_info "Запуск полного цикла: $CRON_JOB"
-
-# ============================================================
 # ПРОВЕРКА УСТАНОВКИ
 # ============================================================
 print_header "ПРОВЕРКА УСТАНОВКИ"
@@ -244,14 +219,16 @@ echo ""
 echo "📋 Структура:"
 ls -la "$INSTALL_DIR"
 echo ""
-echo "⏰ Cron задание:"
-crontab -l | grep vless_checker || echo "  Не найдено"
-echo ""
 echo "🚀 Запуск вручную:"
-echo "  cd $INSTALL_DIR && python3 full_check.py"
+echo "  cd $INSTALL_DIR && nohup python3 full_check.py >> /var/log/vless_full.log 2>&1 &"
 echo ""
 echo "📊 Логи:"
 echo "  tail -f /var/log/vless_full.log"
+echo ""
+echo "⏰ Добавьте задание в cron (ежедневно в 2:00):"
+echo "  crontab -e"
+echo "  Добавьте строку:"
+echo "  0 2 * * * /root/vless_checker/run_full_check.sh"
 echo ""
 echo "✅ Готово!"
 
