@@ -8,9 +8,8 @@
 
 /root/vless_checker/
 
-|├── 📄 vless_check_config.py|# Единый конфигурационный файл|
-
-|├── 📄 vless_checker.py|# ЭТАП 1: Сбор пула ссылок (30 шт)|
+| ├── 📄 vless_check_config.py | # Единый конфигурационный файл |
+| ├── 📄 vless_checker.py | # ЭТАП 1: Сбор пула ссылок (30 шт) |
 
 ├── 📄 server_tester.py               # ЭТАП 2: Тестирование пула → ТОП-10
 
