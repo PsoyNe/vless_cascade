@@ -10,14 +10,23 @@
 /root/vless_checker/
 
 ├── 📄 vless_check_config.py # Единый конфигурационный файл
+
 ├── 📄 vless_checker.py # ЭТАП 1: Сбор пула ссылок (30 шт) 
+
 ├── 📄 server_tester.py # ЭТАП 2: Тестирование пула → ТОП-10
+
 ├── 📄 update_db.py # ЭТАП 3: Обновление 3x-ui
+
 ├── 📄 full_check.py # Запуск всех трёх этапов
+
 ├── 📄 run_stage1.sh # Запуск только этапа 1
+
 ├── 📄 run_stage2.sh # Запуск этапов 2+3
+
 ├── 📄 run_full_check.sh # Запуск полного цикла
+
 ├── 📄 working_links.txt # Пул ссылок (создаётся)
+
 └── 📄 stable_links.txt # ТОП-10 ссылок (создаётся)
 
 ## 📋 Инструкция по установке
@@ -95,16 +104,23 @@ crontab -l | grep vless_checker
 ## Структура логов
 /var/log/
 ├── 📄 vless_full.log                 # Лог полного цикла
+
 ├── 📄 vless_checker.log              # Лог этапа 1
+
 ├── 📄 server_test.log                # Лог этапа 2
+
 ├── 📄 vless_update_db.log            # Лог этапа 3
+
 ├── 📄 stage1.log                     # Лог run_stage1.sh
+
 └── 📄 stage2.log                     # Лог run_stage2.sh
 
 ## Связи между файлами
 vless_check_config.py
     ├── vless_checker.py (импортирует конфиг)
+
     ├── server_tester.py (импортирует конфиг)
+    
     └── update_db.py (импортирует конфиг)
 
 vless_checker.py
@@ -112,10 +128,12 @@ vless_checker.py
 
 server_tester.py
     ├── читает working_links.txt (30 ссылок)
+    
     └── создаёт stable_links.txt (9 ссылок/кол-во из конфига)
 
 update_db.py
     ├── читает stable_links.txt (9 ссылок/кол-во из конфига)
+    
     └── обновляет БД 3x-ui
 
 ## Пояснения
