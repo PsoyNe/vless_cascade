@@ -117,6 +117,7 @@ crontab -l | grep vless_checker
 
 ## Связи между файлами
 vless_check_config.py
+    
     ├── vless_checker.py (импортирует конфиг)
 
     ├── server_tester.py (импортирует конфиг)
@@ -124,14 +125,17 @@ vless_check_config.py
     └── update_db.py (импортирует конфиг)
 
 vless_checker.py
+    
     └── создаёт working_links.txt (30 ссылок)
 
 server_tester.py
+    
     ├── читает working_links.txt (30 ссылок)
     
     └── создаёт stable_links.txt (9 ссылок/кол-во из конфига)
 
 update_db.py
+    
     ├── читает stable_links.txt (9 ссылок/кол-во из конфига)
     
     └── обновляет БД 3x-ui
