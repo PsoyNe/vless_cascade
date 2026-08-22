@@ -10,23 +10,14 @@
 /root/vless_checker/
 
 ├── 📄 vless_check_config.py # Единый конфигурационный файл
-
 ├── 📄 vless_checker.py # ЭТАП 1: Сбор пула ссылок (30 шт) 
-
 ├── 📄 server_tester.py # ЭТАП 2: Тестирование пула → ТОП-10
-
 ├── 📄 update_db.py # ЭТАП 3: Обновление 3x-ui
-
 ├── 📄 full_check.py # Запуск всех трёх этапов
-
 ├── 📄 run_stage1.sh # Запуск только этапа 1
-
 ├── 📄 run_stage2.sh # Запуск этапов 2+3
-
 ├── 📄 run_full_check.sh # Запуск полного цикла
-
 ├── 📄 working_links.txt # Пул ссылок (создаётся)
-
 └── 📄 stable_links.txt # ТОП-10 ссылок (создаётся)
 
 ## 📋 Инструкция по установке
