@@ -101,6 +101,32 @@ crontab -e
 crontab -l | grep vless_checker
 ```
 
+## Структура логов
+/var/log/
+├── 📄 vless_full.log                 # Лог полного цикла
+├── 📄 vless_checker.log              # Лог этапа 1
+├── 📄 server_test.log                # Лог этапа 2
+├── 📄 vless_update_db.log            # Лог этапа 3
+├── 📄 stage1.log                     # Лог run_stage1.sh
+└── 📄 stage2.log                     # Лог run_stage2.sh
+
+## Связи между файлами
+vless_check_config.py
+    ├── vless_checker.py (импортирует конфиг)
+    ├── server_tester.py (импортирует конфиг)
+    └── update_db.py (импортирует конфиг)
+
+vless_checker.py
+    └── создаёт working_links.txt (30 ссылок)
+
+server_tester.py
+    ├── читает working_links.txt (30 ссылок)
+    └── создаёт stable_links.txt (9 ссылок/кол-во из конфига)
+
+update_db.py
+    ├── читает stable_links.txt (9 ссылок/кол-во из конфига)
+    └── обновляет БД 3x-ui
+
 ## Пояснения
 1. Ссылки берутся из свободного доступа. Формат должен совпадать с тем, что выдает github
 2. Тестируется полный доступ к серверу через соединение XRAY, а не просто пинг. По умолчанию на сайт https://check.torproject.org
