@@ -103,6 +103,7 @@ crontab -l | grep vless_checker
 
 ## Структура логов
 /var/log/
+
 ├── 📄 vless_full.log                 # Лог полного цикла
 
 ├── 📄 vless_checker.log              # Лог этапа 1
