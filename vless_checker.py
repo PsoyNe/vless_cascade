@@ -26,7 +26,12 @@ import ssl
 from vless_check_config import *
 
 # ============================================================
-# ЭТАП 1: СБОР ПУЛА ССЫЛОК (vless_checker.py)
+# КОНФИГУРАЦИЯ
+# ============================================================
+QUARANTINE_FILE = "/root/vless_checker/quarantine_links.txt"
+
+# ============================================================
+# ЭТАП 1: СБОР ПУЛА ССЫЛОК
 # ============================================================
 
 logging.basicConfig(
@@ -133,15 +138,51 @@ class VlessChecker:
         except Exception:
             return {}
     
+    def load_quarantine_links(self) -> set:
+        """Загружает ссылки из карантина"""
+        quarantine = set()
+        try:
+            if os.path.exists(QUARANTINE_FILE):
+                with open(QUARANTINE_FILE, 'r') as f:
+                    for line in f:
+                        link = line.strip()
+                        if link.startswith('vless://'):
+                            quarantine.add(link)
+                logger.info(f"Загружено {len(quarantine)} ссылок из карантина")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки карантина: {e}")
+        return quarantine
+    
     def filter_links(self, links: List[str]) -> List[str]:
+        """Фильтрует ссылки: security=reality, port=443, уникальные хосты, не в карантине"""
         filtered = []
+        seen_hosts = set()
+        quarantine = self.load_quarantine_links()
+        
         for link in links:
+            # Проверяем карантин
+            if link in quarantine:
+                continue
+            
             params = self.parse_vless_params(link)
             if params.get('security', '').lower() != 'reality':
                 continue
             if params.get('port') != '443':
                 continue
+            
+            # Проверяем уникальность хоста
+            host = params.get('host', '')
+            if host in seen_hosts:
+                continue
+            seen_hosts.add(host)
+            
             filtered.append(link)
+            
+            # Ограничиваем количество для быстродействия
+            if len(filtered) >= 100:
+                break
+        
+        logger.info(f"Отфильтровано {len(filtered)} ссылок (уникальные хосты, без карантина)")
         return filtered
     
     def _create_xray_config(self, vless_link: str, proxy_port: int) -> dict:
@@ -354,7 +395,7 @@ class VlessChecker:
 
 def main():
     logger.info("="*60)
-    logger.info(f"ЭТАП 1: Сбор {STAGE1_WORKING_COUNT} лучших ссылок (HTTPS, {TEST_HOST})")
+    logger.info(f"ЭТАП 1: Сбор {STAGE1_WORKING_COUNT} лучших ссылок (уникальные хосты, без карантина)")
     logger.info("="*60)
     
     if not os.path.exists(XRAY_PATH):
@@ -371,7 +412,6 @@ def main():
         logger.info(f"Найдено {len(all_links)} ссылок")
         
         filtered_links = checker.filter_links(all_links)
-        logger.info(f"Отфильтровано {len(filtered_links)} ссылок (security=reality, port=443)")
         
         if not filtered_links:
             logger.error("Нет ссылок для проверки!")
@@ -388,7 +428,7 @@ def main():
         
         logger.info("="*60)
         logger.info("✅ ЭТАП 1 ЗАВЕРШЕН")
-        logger.info(f"📁 30 лучших ссылок сохранены в: {WORKING_LINKS_FILE}")
+        logger.info(f"📁 30 лучших ссылок (уникальные хосты) сохранены в: {WORKING_LINKS_FILE}")
         logger.info("="*60)
         
     except Exception as e:
