@@ -228,6 +228,8 @@ class VlessObserver:
         self.waiting_for_links = False
 
         self.trigger_file = "/tmp/vless_observer_trigger"
+        self.quarantine_trigger = "/tmp/vless_quarantine_trigger"
+        self.quarantine_file = "/root/vless_checker/quarantine_links.txt"
         self.trigger_checked = False
         
     def load_links(self):
@@ -420,7 +422,6 @@ class VlessObserver:
         self.backup_check_counter += 1
         
         for item in self.backup_pool:
-            # СИМУЛЯЦИЯ: здесь будет реальная проверка через прокси
             is_working = True
             
             if is_working:
@@ -491,14 +492,51 @@ class VlessObserver:
                 logger.error(f"Ошибка удаления триггер-файла: {e}")
         return False
     
+    def check_quarantine_trigger(self):
+        if os.path.exists(self.quarantine_trigger):
+            try:
+                os.remove(self.quarantine_trigger)
+                logger.warning(f"⚠️ КАРАНТИН: Обнаружен файл {self.quarantine_trigger}")
+                self.move_primary_to_quarantine()
+                return True
+            except Exception as e:
+                logger.error(f"Ошибка удаления триггера карантина: {e}")
+        return False
+    
+    def move_primary_to_quarantine(self):
+        if not self.primary:
+            logger.warning("Нет основной ссылки для помещения в карантин")
+            return
+        
+        old_primary = self.primary
+        old_host = parse_vless_link(old_primary)['host']
+        
+        logger.warning(f"🛑 КАРАНТИН: Основная ссылка {old_host} отправляется в карантин")
+        
+        try:
+            os.makedirs(os.path.dirname(self.quarantine_file), exist_ok=True)
+            with open(self.quarantine_file, 'a') as f:
+                f.write(f"{old_primary}\n")
+            logger.info(f"✅ Ссылка добавлена в карантин: {self.quarantine_file}")
+        except Exception as e:
+            logger.error(f"Ошибка записи в карантин: {e}")
+        
+        self.backup_pool = [item for item in self.backup_pool if item['link'] != old_primary]
+        self.switch_to_backup()
+    
     def test_primary(self):
+        # Проверяем триггер карантина
+        if self.check_quarantine_trigger():
+            return
+        
+        # Проверяем обычный триггер
         if self.check_trigger_file():
             logger.warning(f"❌ ИМИТАЦИЯ 2 ОТКАЗОВ: переключение...")
             self.switch_to_backup()
             self.log_status(force=True)
             return
         
-        # СИМУЛЯЦИЯ: здесь будет реальная проверка через прокси
+        # Нормальная проверка
         is_working = True
         
         if is_working:
@@ -569,6 +607,7 @@ class VlessObserver:
         logger.info(f"Проверка: {CHECK_INTERVAL_PRIMARY}с | Переключение: {FAILURES_TO_SWITCH} отказа")
         logger.info(f"Обновление пула: каждые {POOL_UPDATE_INTERVAL//3600} часов")
         logger.info(f"Триггер-файл: {self.trigger_file} (создайте для имитации отказа)")
+        logger.info(f"Карантин-триггер: {self.quarantine_trigger} (создайте для отправки ссылки в карантин)")
         logger.info("="*50)
         
         last_backup_check = time.time()
