@@ -1,7 +1,6 @@
 #!/bin/bash
 # ============================================================
-# VLESS CHECKER INSTALLER
-# ============================================================
+# VLESS CHECKER + OBSERVER INSTALLER
 # Установка системы автоматического обновления outbound'ов 3x-ui
 # ============================================================
 
@@ -16,51 +15,11 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# ============================================================
-# ПЕРЕМЕННЫЕ
-# ============================================================
-INSTALL_DIR="/root/vless_checker"
-GITHUB_RAW="https://raw.githubusercontent.com/PsoyNe/vless_cascade/refs/heads/main"
-LOG_DIR="/var/log"
-
-# Список файлов для скачивания
-FILES=(
-    "vless_check_config.py"
-    "vless_checker.py"
-    "server_tester.py"
-    "update_db.py"
-    "full_check.py"
-    "run_stage1.sh"
-    "run_stage2.sh"
-    "run_full_check.sh"
-)
-
-# ============================================================
-# ФУНКЦИИ
-# ============================================================
-print_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
-
-print_success() {
-    echo -e "${GREEN}[OK]${NC} $1"
-}
-
-print_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-print_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
-
-print_header() {
-    echo ""
-    echo "============================================================"
-    echo " $1"
-    echo "============================================================"
-    echo ""
-}
+print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+print_success() { echo -e "${GREEN}[OK]${NC} $1"; }
+print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+print_header() { echo ""; echo "============================================================"; echo " $1"; echo "============================================================"; echo ""; }
 
 # ============================================================
 # ПРОВЕРКА ПРАВ
@@ -75,23 +34,11 @@ fi
 # ============================================================
 print_header "ПРОВЕРКА СИСТЕМЫ"
 
-# Проверка архитектуры
 ARCH=$(uname -m)
 print_info "Архитектура: $ARCH"
 
 if [[ "$ARCH" != "armv7l" && "$ARCH" != "aarch64" ]]; then
     print_warning "Архитектура не ARM. Скрипт оптимизирован для NanoPi Neo."
-fi
-
-# Проверка ОС
-if command -v lsb_release &> /dev/null; then
-    OS=$(lsb_release -is 2>/dev/null || echo "Unknown")
-else
-    OS="Unknown"
-fi
-
-if [[ "$OS" != "Debian" && "$OS" != "Ubuntu" ]]; then
-    print_warning "ОС: $OS. Рекомендуется Debian/Ubuntu."
 fi
 
 # ============================================================
@@ -141,65 +88,152 @@ else
     print_success "3x-ui найден"
 fi
 
-# Проверка Xray
-if [ ! -f "/usr/local/x-ui/bin/xray-linux-arm32" ]; then
-    print_warning "Xray не найден по пути /usr/local/x-ui/bin/xray-linux-arm32"
-    print_info "Попробуйте найти Xray: find / -name 'xray*' -type f 2>/dev/null"
-    print_info "Измените путь XRAY_PATH в vless_check_config.py"
-fi
-
 # ============================================================
-# СОЗДАНИЕ ДИРЕКТОРИИ
+# УСТАНОВКА VLESS CHECKER (Alpha)
 # ============================================================
-print_header "СОЗДАНИЕ ДИРЕКТОРИИ"
+print_header "УСТАНОВКА VLESS CHECKER (Alpha)"
 
-if [ -d "$INSTALL_DIR" ]; then
-    print_warning "Директория $INSTALL_DIR уже существует"
+CHECKER_DIR="/root/vless_checker"
+GITHUB_RAW="https://raw.githubusercontent.com/PsoyNe/vless_cascade/refs/heads/main"
+
+if [ -d "$CHECKER_DIR" ]; then
+    print_warning "Директория $CHECKER_DIR уже существует"
     read -p "Перезаписать файлы? (y/n): " -n 1 -r
     echo ""
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        print_info "Установка отменена"
-        exit 0
+        print_info "Установка чекера пропущена"
+    else
+        rm -rf "$CHECKER_DIR"
+        mkdir -p "$CHECKER_DIR"
+        cd "$CHECKER_DIR"
+        
+        # Скачиваем файлы чекера
+        for file in vless_check_config.py vless_checker.py server_tester.py full_check.py run_stage1.sh run_stage2.sh run_full_check.sh; do
+            print_info "Скачивание: $file"
+            wget -q "$GITHUB_RAW/$file" -O "$file"
+        done
+        
+        chmod +x *.py *.sh 2>/dev/null
+        print_success "VLESS Checker установлен"
     fi
-    rm -rf "$INSTALL_DIR"
+else
+    mkdir -p "$CHECKER_DIR"
+    cd "$CHECKER_DIR"
+    
+    for file in vless_check_config.py vless_checker.py server_tester.py full_check.py run_stage1.sh run_stage2.sh run_full_check.sh; do
+        print_info "Скачивание: $file"
+        wget -q "$GITHUB_RAW/$file" -O "$file"
+    done
+    
+    chmod +x *.py *.sh 2>/dev/null
+    print_success "VLESS Checker установлен"
 fi
 
-mkdir -p "$INSTALL_DIR"
-print_success "Директория создана: $INSTALL_DIR"
-
 # ============================================================
-# СКАЧИВАНИЕ ФАЙЛОВ
+# УСТАНОВКА VLESS OBSERVER
 # ============================================================
-print_header "СКАЧИВАНИЕ ФАЙЛОВ"
+print_header "УСТАНОВКА VLESS OBSERVER"
 
-cd "$INSTALL_DIR"
+OBSERVER_DIR="/root/vless_observer"
 
-for file in "${FILES[@]}"; do
-    print_info "Скачивание: $file"
-    if wget -q "$GITHUB_RAW/$file" -O "$file"; then
-        print_success "  $file"
+if [ -d "$OBSERVER_DIR" ]; then
+    print_warning "Директория $OBSERVER_DIR уже существует"
+    read -p "Перезаписать файлы? (y/n): " -n 1 -r
+    echo ""
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        print_info "Установка обсерватории пропущена"
     else
-        print_error "  Не удалось скачать $file"
-        exit 1
+        rm -rf "$OBSERVER_DIR"
+        mkdir -p "$OBSERVER_DIR"
+        cd "$OBSERVER_DIR"
+        
+        wget -q "$GITHUB_RAW/observer_config.py" -O observer_config.py
+        wget -q "$GITHUB_RAW/observer.py" -O observer.py
+        
+        chmod +x observer.py
+        print_success "VLESS Observer установлен"
     fi
-done
+else
+    mkdir -p "$OBSERVER_DIR"
+    cd "$OBSERVER_DIR"
+    
+    wget -q "$GITHUB_RAW/observer_config.py" -O observer_config.py
+    wget -q "$GITHUB_RAW/observer.py" -O observer.py
+    
+    chmod +x observer.py
+    print_success "VLESS Observer установлен"
+fi
 
-# Делаем скрипты исполняемыми
-chmod +x *.py 2>/dev/null
-chmod +x *.sh 2>/dev/null
+# ============================================================
+# НАСТРОЙКА CRON ДЛЯ ЧЕКЕРА
+# ============================================================
+print_header "НАСТРОЙКА CRON ДЛЯ ЧЕКЕРА"
 
-print_success "Все файлы скачаны и готовы к использованию"
+CRON_JOB_CHECKER="0 2 * * * /root/vless_checker/run_full_check.sh"
+
+if crontab -l 2>/dev/null | grep -q "vless_checker"; then
+    print_warning "Cron задание для чекера уже существует"
+    read -p "Перезаписать? (y/n): " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        (crontab -l 2>/dev/null | grep -v "vless_checker"; echo "$CRON_JOB_CHECKER") | crontab -
+        print_success "Cron задание для чекера обновлено"
+    fi
+else
+    (crontab -l 2>/dev/null; echo "$CRON_JOB_CHECKER") | crontab -
+    print_success "Cron задание для чекера добавлено"
+fi
+
+# ============================================================
+# НАСТРОЙКА СИСТЕМНОЙ СЛУЖБЫ ДЛЯ OBSERVER
+# ============================================================
+print_header "НАСТРОЙКА СЛУЖБЫ OBSERVER"
+
+cat > /etc/systemd/system/vless_observer.service << 'EOF'
+[Unit]
+Description=VLESS Observer - automatic outbound monitoring and switching
+After=network.target x-ui.service
+Wants=x-ui.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/vless_observer
+ExecStart=/usr/bin/python3 /root/vless_observer/observer.py
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/vless_observer.log
+StandardError=append:/var/log/vless_observer.log
+PIDFile=/var/run/vless_observer.pid
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable vless_observer
+systemctl start vless_observer
+
+print_success "Служба Observer запущена"
 
 # ============================================================
 # ПРОВЕРКА УСТАНОВКИ
 # ============================================================
 print_header "ПРОВЕРКА УСТАНОВКИ"
 
-print_info "Проверка конфига..."
-if python3 -c "import vless_check_config" 2>/dev/null; then
-    print_success "Конфиг корректен"
+print_info "Проверка конфига чекера..."
+if python3 -c "import sys; sys.path.insert(0, '/root/vless_checker'); import vless_check_config" 2>/dev/null; then
+    print_success "Конфиг чекера корректен"
 else
-    print_warning "Ошибка импорта конфига"
+    print_warning "Ошибка импорта конфига чекера"
+fi
+
+print_info "Проверка конфига обсерватории..."
+if python3 -c "import sys; sys.path.insert(0, '/root/vless_observer'); import observer_config" 2>/dev/null; then
+    print_success "Конфиг обсерватории корректен"
+else
+    print_warning "Ошибка импорта конфига обсерватории"
 fi
 
 print_info "Проверка Python модулей..."
@@ -214,22 +248,25 @@ fi
 # ============================================================
 print_header "УСТАНОВКА ЗАВЕРШЕНА"
 
-echo "📁 Директория: $INSTALL_DIR"
+echo "📁 VLESS Checker: /root/vless_checker/"
+echo "📁 VLESS Observer: /root/vless_observer/"
 echo ""
-echo "📋 Структура:"
-ls -la "$INSTALL_DIR"
+echo "⏰ Cron задание:"
+crontab -l | grep vless_checker || echo "  Не найдено"
+echo ""
+echo "🔄 Служба Observer:"
+systemctl status vless_observer --no-pager
 echo ""
 echo "🚀 Запуск вручную:"
-echo "  cd $INSTALL_DIR && nohup python3 full_check.py >> /var/log/vless_full.log 2>&1 &"
+echo "  VLESS Checker: cd /root/vless_checker && python3 full_check.py"
+echo "  VLESS Observer: systemctl start vless_observer"
 echo ""
 echo "📊 Логи:"
 echo "  tail -f /var/log/vless_full.log"
+echo "  tail -f /var/log/vless_observer.log"
 echo ""
-echo "⏰ Добавьте задание в cron (ежедневно в 2:00):"
-echo "  crontab -e"
-echo "  Добавьте строку:"
-echo "  0 2 * * * /root/vless_checker/run_full_check.sh"
+echo "🔧 Триггер Observer (имитация отказа):"
+echo "  touch /tmp/vless_observer_trigger"
 echo ""
-echo "✅ Готово!"
 
-exit 0
+print_success "✅ Готово!"
