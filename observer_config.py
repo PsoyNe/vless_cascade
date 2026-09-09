@@ -15,17 +15,19 @@ LOG_FILE = "/var/log/vless_observer.log"
 # -------------------- НАСТРОЙКИ МОНИТОРИНГА --------------------
 CHECK_INTERVAL_PRIMARY = 5        # Проверка основной ссылки (сек)
 CHECK_INTERVAL_BACKUP = 30        # Проверка резервных ссылок (сек)
-FAILURES_TO_SWITCH = 5            # ← ИЗМЕНЕНО: 5 отказов подряд (было 2)
+FAILURES_TO_SWITCH = 5            # Отказов подряд для переключения
 BACKUP_POOL_SIZE = 4              # Размер резервного пула
 POOL_UPDATE_INTERVAL = 21600      # Обновление пула из файла (сек) = 6 часов
 
 # -------------------- НАСТРОЙКИ ТЕСТИРОВАНИЯ --------------------
-TEST_HOST = 'check.torproject.org'
+# ЛЁГКАЯ ПРОВЕРКА: HEAD запрос к Google (без тела)
+TEST_HOST = 'www.google.com'
 TEST_PORT = 443
-TEST_PATH = '/'
-TEST_TIMEOUT = 10
-TEST_BUFFER_SIZE = 65536
-TEST_EXPECTED_STRING = b'You are not using Tor'
+TEST_PATH = '/generate_204'
+TEST_METHOD = 'HEAD'
+TEST_TIMEOUT = 8
+TEST_BUFFER_SIZE = 1024
+TEST_EXPECTED_STATUS = 204
 
 # -------------------- НАСТРОЙКИ 3X-UI --------------------
 OUTBOUND_NAME = "vless_obs"
