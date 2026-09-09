@@ -53,27 +53,24 @@ def run_script(script: str, description: str) -> bool:
 
 def main():
     logger.info("="*60)
-    logger.info("🔄 ЗАПУСК ПОЛНОГО ЦИКЛА (ЭТАПЫ 1, 2, 3)")
+    logger.info("🔄 ПОЛНЫЙ ЦИКЛ (vless_checker → server_tester)")
     logger.info("="*60)
     logger.info(f"Время начала: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("="*60)
     
     start_time = time.time()
     
-    # ЭТАП 1: Сбор пула ссылок
+    # ЭТАП 1: Сбор пула ссылок (создаёт working_links.txt)
     if not run_script('/root/vless_checker/vless_checker.py', 'Этап 1: сбор пула ссылок'):
         logger.error("❌ Критическая ошибка на ЭТАПЕ 1. Прерывание.")
         sys.exit(1)
     
-    # ЭТАП 2: Тестирование пула
+    # ЭТАП 2: Тестирование пула (создаёт stable_links.txt)
     if not run_script('/root/vless_checker/server_tester.py', 'Этап 2: тестирование пула → ТОП-10'):
         logger.error("❌ Критическая ошибка на ЭТАПЕ 2. Прерывание.")
         sys.exit(1)
     
-    # ЭТАП 3: Обновление 3x-ui
-    if not run_script('/root/vless_checker/update_db.py', 'Этап 3: обновление 3x-ui'):
-        logger.error("❌ Критическая ошибка на ЭТАПЕ 3. Прерывание.")
-        sys.exit(1)
+    # ЭТАП 3: УДАЛЁН — обновление 3x-ui теперь делает Observer
     
     elapsed = time.time() - start_time
     
