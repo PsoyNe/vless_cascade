@@ -31,15 +31,18 @@ os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+# Файловый обработчик (всегда)
 file_handler = logging.FileHandler(LOG_FILE)
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S'))
 logger.addHandler(file_handler)
 
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.DEBUG)
-console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S'))
-logger.addHandler(console_handler)
+# Консольный обработчик — ТОЛЬКО при ручном запуске (с терминалом)
+if sys.stdout.isatty():
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.DEBUG)
+    console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S'))
+    logger.addHandler(console_handler)
 
 # ============================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -159,7 +162,8 @@ def start_xray(config_path: str, xray_path: str = XRAY_PATH) -> subprocess.Popen
 
 def test_link_through_xray(link: str, proxy_port: int, timeout: int = TEST_TIMEOUT) -> Tuple[bool, float, int]:
     """
-    Проверяет ссылку через реальный запуск Xray
+    ЛЁГКАЯ проверка ссылки через реальный запуск Xray
+    Отправляет HEAD запрос к google.com/generate_204
     Возвращает: (успех, время_в_мс, размер_ответа)
     """
     temp_dir = tempfile.mkdtemp(prefix="observer_test_")
@@ -176,10 +180,10 @@ def test_link_through_xray(link: str, proxy_port: int, timeout: int = TEST_TIMEO
         # Запускаем Xray
         process = start_xray(config_path)
         
-        # Даём время на запуск
-        time.sleep(2)
+        # Даём время на запуск (1.5 сек)
+        time.sleep(1.5)
         
-        # Проверяем через прокси
+        # Проверяем через прокси (HEAD запрос)
         start_time = time.time()
         s = socks.socksocket()
         s.set_proxy(socks.SOCKS5, "127.0.0.1", proxy_port)
@@ -194,30 +198,21 @@ def test_link_through_xray(link: str, proxy_port: int, timeout: int = TEST_TIMEO
         ssl_sock = context.wrap_socket(s, server_hostname=TEST_HOST)
         s = ssl_sock
         
-        request = f"GET {TEST_PATH} HTTP/1.1\r\nHost: {TEST_HOST}\r\nConnection: close\r\n\r\n".encode()
+        # HEAD запрос (без тела)
+        request = f"HEAD {TEST_PATH} HTTP/1.1\r\nHost: {TEST_HOST}\r\nConnection: close\r\n\r\n".encode()
         s.send(request)
         
-        response = b""
-        while True:
-            try:
-                chunk = s.recv(TEST_BUFFER_SIZE)
-                if not chunk:
-                    break
-                response += chunk
-                if len(chunk) < TEST_BUFFER_SIZE:
-                    break
-            except socket.timeout:
-                break
-        
-        response_size = len(response)
+        # Читаем только заголовки (первые 1024 байта)
+        response = s.recv(TEST_BUFFER_SIZE)
         elapsed = (time.time() - start_time) * 1000
         
-        if response and TEST_EXPECTED_STRING in response:
-            return (True, elapsed, response_size)
+        # Проверяем статус 204 или 200
+        if response and (b"204" in response or b"200" in response):
+            return (True, elapsed, len(response))
         else:
-            return (False, elapsed, response_size)
+            return (False, elapsed, len(response))
         
-    except Exception as e:
+    except Exception:
         elapsed = (time.time() - start_time) * 1000
         return (False, elapsed, 0)
     finally:
@@ -361,8 +356,7 @@ class VlessObserver:
         self.proxy_port = 10808
         self.trigger_file = "/tmp/vless_observer_trigger"
         self.quarantine_trigger = "/tmp/vless_quarantine_trigger"
-        self.quarantine_file = "/root/vless_checker/quarantine_links.txt"
-        self.trigger_checked = False
+        self.dead_links = set()  # Мёртвые ссылки (временный карантин в памяти)
         
     def load_links(self):
         if not os.path.exists(LINKS_FILE):
@@ -443,12 +437,17 @@ class VlessObserver:
             return False
     
     def update_pool_from_file(self):
+        """Периодическое обновление пула из файла (каждые 6 часов)"""
         current_time = time.time()
         
         if current_time - self.last_pool_update_time < POOL_UPDATE_INTERVAL:
             return
         
         logger.info("🔄 Периодическое обновление пула из файла...")
+        
+        # Очищаем список мёртвых ссылок при обновлении пула
+        self.dead_links.clear()
+        logger.info("🧹 Список мёртвых ссылок очищен")
         
         if not os.path.exists(LINKS_FILE):
             logger.warning("⚠️ Файл stable_links.txt не найден для обновления")
@@ -553,6 +552,8 @@ class VlessObserver:
         
         self.backup_check_counter += 1
         
+        dead_links = []
+        
         for item in self.backup_pool:
             # Проверяем через реальный запуск Xray
             is_working, ping, size = test_link_through_xray(
@@ -567,24 +568,29 @@ class VlessObserver:
             else:
                 item['alive'] = False
                 item['ping'] = 0
+                dead_links.append(item['link'])
                 logger.warning(f"⚠️ Резервная ссылка {item['host']} мертва!")
         
-        dead_count = len([item for item in self.backup_pool if not item.get('alive', False)])
-        if dead_count > 0:
-            self.backup_pool = [item for item in self.backup_pool if item.get('alive', False)]
-            logger.warning(f"⚠️ Удалено {dead_count} мёртвых резервных ссылок")
+        # Удаляем мёртвые ссылки из резерва
+        if dead_links:
+            self.backup_pool = [item for item in self.backup_pool if item['link'] not in dead_links]
+            # Добавляем мёртвые ссылки в список (чтобы не добавлять обратно)
+            self.dead_links.update(dead_links)
+            logger.warning(f"⚠️ Удалено {len(dead_links)} мёртвых резервных ссылок, добавлены в чёрный список")
             
+            # Пополняем пул (НО исключая мёртвые)
             if len(self.backup_pool) < BACKUP_POOL_SIZE:
-                self.refill_pool()
+                self.refill_pool_excluding_dead()
         
         self.backup_pool.sort(key=lambda x: (not x.get('alive', False), x.get('ping', 9999)))
         
         alive_count = len([item for item in self.backup_pool if item.get('alive', False)])
         if alive_count == 0 and len(self.backup_pool) > 0:
             logger.warning("⚠️ Все резервные ссылки мертвы! Пополнение пула...")
-            self.refill_pool()
+            self.refill_pool_excluding_dead()
     
-    def refill_pool(self):
+    def refill_pool_excluding_dead(self):
+        """Пополняет резервный пул из файла, исключая мёртвые ссылки"""
         if not os.path.exists(LINKS_FILE):
             return
         
@@ -597,7 +603,14 @@ class VlessObserver:
             
             current = self.primary
             existing_links = [item['link'] for item in self.backup_pool]
-            available = [l for l in all_links if l != current and l not in existing_links]
+            
+            # Исключаем: основную, уже существующие в резерве, мёртвые
+            available = [
+                l for l in all_links 
+                if l != current 
+                and l not in existing_links 
+                and l not in self.dead_links
+            ]
             
             if not available:
                 return
@@ -650,14 +663,10 @@ class VlessObserver:
         
         logger.warning(f"🛑 КАРАНТИН: Основная ссылка {old_host} отправляется в карантин")
         
-        try:
-            os.makedirs(os.path.dirname(self.quarantine_file), exist_ok=True)
-            with open(self.quarantine_file, 'a') as f:
-                f.write(f"{old_primary}\n")
-            logger.info(f"✅ Ссылка добавлена в карантин: {self.quarantine_file}")
-        except Exception as e:
-            logger.error(f"Ошибка записи в карантин: {e}")
+        # Добавляем в список мёртвых
+        self.dead_links.add(old_primary)
         
+        # Удаляем из резерва
         self.backup_pool = [item for item in self.backup_pool if item['link'] != old_primary]
         self.switch_to_backup()
     
@@ -684,7 +693,7 @@ class VlessObserver:
             self.primary_stats['success_count'] += 1
             self.primary_stats['fail_count'] = 0
             self.critical_error_logged = False
-            logger.debug(f"✅ Основная ссылка работает (пинг: {ping:.0f}мс, ответ: {size} байт)")
+            logger.debug(f"✅ Основная ссылка работает (пинг: {ping:.0f}мс)")
         else:
             self.primary_stats['fail_count'] += 1
             logger.warning(f"❌ Отказ основной ссылки ({self.primary_stats['fail_count']}/{FAILURES_TO_SWITCH})")
@@ -698,7 +707,7 @@ class VlessObserver:
         
         if not alive_backups:
             logger.warning("⚠️ Нет живых резервных ссылок! Пополнение пула...")
-            self.refill_pool()
+            self.refill_pool_excluding_dead()
             alive_backups = [item for item in self.backup_pool if item.get('alive', False)]
             
             if not alive_backups:
@@ -724,7 +733,7 @@ class VlessObserver:
             self.primary_stats['fail_count'] = 0
             self.critical_error_logged = False
             
-            self.refill_pool()
+            self.refill_pool_excluding_dead()
             
             logger.info(f"✅ Переключение выполнено (№{self.switch_count})")
             self.log_status(force=True)
@@ -748,8 +757,8 @@ class VlessObserver:
         self.init_pool()
         
         logger.info(f"Проверка: {CHECK_INTERVAL_PRIMARY}с | Переключение: {FAILURES_TO_SWITCH} отказа")
-        logger.info(f"Обновление пула: каждые {POOL_UPDATE_INTERVAL//3600} часов")
-        logger.info(f"Тестовый хост: {TEST_HOST}")
+        logger.info(f"Обновление пула: каждые {POOL_UPDATE_INTERVAL//3600} часов (мёртвые ссылки забываются)")
+        logger.info(f"Тестовый хост: {TEST_HOST}{TEST_PATH} (HEAD запрос)")
         logger.info(f"Триггер-файл: {self.trigger_file} (создайте для имитации отказа)")
         logger.info(f"Карантин-триггер: {self.quarantine_trigger} (создайте для отправки ссылки в карантин)")
         logger.info("="*50)
