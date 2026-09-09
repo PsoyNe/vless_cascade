@@ -13,6 +13,8 @@ import socket
 import socks
 import ssl
 import re
+import tempfile
+import shutil
 from urllib.parse import unquote
 from datetime import datetime
 from typing import List, Tuple, Optional, Dict
@@ -76,6 +78,166 @@ def parse_vless_link(link: str) -> dict:
     except Exception as e:
         logger.error(f"Ошибка парсинга: {e}")
         return None
+
+def create_xray_config(link: str, proxy_port: int) -> dict:
+    """Создает конфиг Xray из vless ссылки"""
+    params = parse_vless_link(link)
+    if not params or 'host' not in params:
+        raise ValueError("Неверный формат vless ссылки")
+    
+    uuid = params['uuid']
+    host = params['host']
+    port = params['port']
+    
+    reality_settings = {
+        "serverName": params['params'].get('sni', host),
+        "fingerprint": params['params'].get('fp', 'chrome'),
+        "publicKey": params['params'].get('pbk', ''),
+        "shortId": params['params'].get('sid', ''),
+        "spiderX": "",
+        "mldsa65Verify": ""
+    }
+    
+    spx = params['params'].get('spx', '')
+    if spx:
+        spx_clean = re.sub(r'[^a-zA-Z0-9/]', '', spx)
+        if spx_clean:
+            reality_settings["spiderX"] = spx_clean
+    
+    config = {
+        "log": {"loglevel": "error"},
+        "inbounds": [{
+            "port": proxy_port,
+            "protocol": "socks",
+            "settings": {"auth": "noauth", "udp": True}
+        }],
+        "outbounds": [{
+            "protocol": "vless",
+            "settings": {
+                "vnext": [{
+                    "address": host,
+                    "port": port,
+                    "users": [{
+                        "id": uuid,
+                        "encryption": params['params'].get('encryption', 'none'),
+                        "flow": params['params'].get('flow', ''),
+                        "level": 0
+                    }]
+                }]
+            },
+            "streamSettings": {
+                "network": params['params'].get('type', 'tcp'),
+                "security": params['params'].get('security', 'reality'),
+                "tcpSettings": {"header": {"type": "none"}},
+                "realitySettings": reality_settings
+            }
+        }]
+    }
+    
+    if 'streamSettings' in config['outbounds'][0]:
+        stream = config['outbounds'][0]['streamSettings']
+        if stream.get('realitySettings') is None:
+            del stream['realitySettings']
+    
+    return config
+
+def start_xray(config_path: str, xray_path: str = XRAY_PATH) -> subprocess.Popen:
+    """Запускает Xray с конфигом"""
+    cmd = [xray_path, "-config", config_path]
+    env = os.environ.copy()
+    env['XRAY_LOCATION_ASSET'] = '/usr/local/share/xray'
+    
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        preexec_fn=os.setsid if hasattr(os, 'setsid') else None,
+        env=env
+    )
+    
+    return process
+
+def test_link_through_xray(link: str, proxy_port: int, timeout: int = TEST_TIMEOUT) -> Tuple[bool, float, int]:
+    """
+    Проверяет ссылку через реальный запуск Xray
+    Возвращает: (успех, время_в_мс, размер_ответа)
+    """
+    temp_dir = tempfile.mkdtemp(prefix="observer_test_")
+    process = None
+    s = None
+    
+    try:
+        # Создаём конфиг
+        config = create_xray_config(link, proxy_port)
+        config_path = os.path.join(temp_dir, "config.json")
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        
+        # Запускаем Xray
+        process = start_xray(config_path)
+        
+        # Даём время на запуск
+        time.sleep(2)
+        
+        # Проверяем через прокси
+        start_time = time.time()
+        s = socks.socksocket()
+        s.set_proxy(socks.SOCKS5, "127.0.0.1", proxy_port)
+        s.settimeout(timeout)
+        
+        s.connect((TEST_HOST, TEST_PORT))
+        
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        
+        ssl_sock = context.wrap_socket(s, server_hostname=TEST_HOST)
+        s = ssl_sock
+        
+        request = f"GET {TEST_PATH} HTTP/1.1\r\nHost: {TEST_HOST}\r\nConnection: close\r\n\r\n".encode()
+        s.send(request)
+        
+        response = b""
+        while True:
+            try:
+                chunk = s.recv(TEST_BUFFER_SIZE)
+                if not chunk:
+                    break
+                response += chunk
+                if len(chunk) < TEST_BUFFER_SIZE:
+                    break
+            except socket.timeout:
+                break
+        
+        response_size = len(response)
+        elapsed = (time.time() - start_time) * 1000
+        
+        if response and TEST_EXPECTED_STRING in response:
+            return (True, elapsed, response_size)
+        else:
+            return (False, elapsed, response_size)
+        
+    except Exception as e:
+        elapsed = (time.time() - start_time) * 1000
+        return (False, elapsed, 0)
+    finally:
+        if s:
+            try:
+                s.close()
+            except:
+                pass
+        if process:
+            try:
+                process.terminate()
+                time.sleep(0.5)
+                if process.poll() is None:
+                    process.kill()
+            except:
+                pass
+        try:
+            shutil.rmtree(temp_dir)
+        except:
+            pass
 
 def create_outbound_config(link: str, name: str) -> dict:
     parsed = parse_vless_link(link)
@@ -176,37 +338,6 @@ def reload_xray():
         logger.error(f"❌ Не удалось перезапустить x-ui: {e}")
         return False
 
-def test_connection_through_proxy(proxy_port: int, timeout: int = TEST_TIMEOUT) -> Tuple[bool, float, str]:
-    start_time = time.time()
-    s = None
-    try:
-        s = socks.socksocket()
-        s.set_proxy(socks.SOCKS5, "127.0.0.1", proxy_port)
-        s.settimeout(timeout)
-        s.connect((TEST_HOST, TEST_PORT))
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-        ssl_sock = context.wrap_socket(s, server_hostname=TEST_HOST)
-        s = ssl_sock
-        request = f"HEAD {TEST_PATH} HTTP/1.1\r\nHost: {TEST_HOST}\r\nConnection: close\r\n\r\n".encode()
-        s.send(request)
-        response = s.recv(TEST_BUFFER_SIZE)
-        elapsed = (time.time() - start_time) * 1000
-        if response and (b"204" in response or b"200" in response):
-            return (True, elapsed, "OK")
-        else:
-            return (False, elapsed, f"Неверный ответ: {response[:30]}")
-    except Exception as e:
-        elapsed = (time.time() - start_time) * 1000
-        return (False, elapsed, f"Ошибка: {str(e)[:30]}")
-    finally:
-        if s:
-            try:
-                s.close()
-            except:
-                pass
-
 # ============================================================
 # ОСНОВНОЙ КЛАСС
 # ============================================================
@@ -227,6 +358,7 @@ class VlessObserver:
         self.last_pool_update_time = 0
         self.waiting_for_links = False
 
+        self.proxy_port = 10808
         self.trigger_file = "/tmp/vless_observer_trigger"
         self.quarantine_trigger = "/tmp/vless_quarantine_trigger"
         self.quarantine_file = "/root/vless_checker/quarantine_links.txt"
@@ -422,11 +554,16 @@ class VlessObserver:
         self.backup_check_counter += 1
         
         for item in self.backup_pool:
-            is_working = True
+            # Проверяем через реальный запуск Xray
+            is_working, ping, size = test_link_through_xray(
+                item['link'], 
+                self.proxy_port, 
+                timeout=TEST_TIMEOUT
+            )
             
             if is_working:
                 item['alive'] = True
-                item['ping'] = random.randint(80, 200)
+                item['ping'] = ping
             else:
                 item['alive'] = False
                 item['ping'] = 0
@@ -536,15 +673,21 @@ class VlessObserver:
             self.log_status(force=True)
             return
         
-        # Нормальная проверка
-        is_working = True
+        # Реальная проверка через запуск Xray
+        is_working, ping, size = test_link_through_xray(
+            self.primary, 
+            self.proxy_port, 
+            timeout=TEST_TIMEOUT
+        )
         
         if is_working:
             self.primary_stats['success_count'] += 1
             self.primary_stats['fail_count'] = 0
             self.critical_error_logged = False
+            logger.debug(f"✅ Основная ссылка работает (пинг: {ping:.0f}мс, ответ: {size} байт)")
         else:
             self.primary_stats['fail_count'] += 1
+            logger.warning(f"❌ Отказ основной ссылки ({self.primary_stats['fail_count']}/{FAILURES_TO_SWITCH})")
             
             if self.primary_stats['fail_count'] >= FAILURES_TO_SWITCH:
                 self.switch_to_backup()
@@ -606,6 +749,7 @@ class VlessObserver:
         
         logger.info(f"Проверка: {CHECK_INTERVAL_PRIMARY}с | Переключение: {FAILURES_TO_SWITCH} отказа")
         logger.info(f"Обновление пула: каждые {POOL_UPDATE_INTERVAL//3600} часов")
+        logger.info(f"Тестовый хост: {TEST_HOST}")
         logger.info(f"Триггер-файл: {self.trigger_file} (создайте для имитации отказа)")
         logger.info(f"Карантин-триггер: {self.quarantine_trigger} (создайте для отправки ссылки в карантин)")
         logger.info("="*50)
