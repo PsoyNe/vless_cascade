@@ -153,6 +153,21 @@ class VlessChecker:
             logger.error(f"Ошибка загрузки карантина: {e}")
         return quarantine
     
+    def load_existing_links(self) -> set:
+        """Загружает существующие ссылки из working_links.txt"""
+        existing = set()
+        try:
+            if os.path.exists(WORKING_LINKS_FILE):
+                with open(WORKING_LINKS_FILE, 'r') as f:
+                    for line in f:
+                        link = line.strip()
+                        if link.startswith('vless://'):
+                            existing.add(link)
+                logger.info(f"Загружено {len(existing)} существующих ссылок из {WORKING_LINKS_FILE}")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки существующих ссылок: {e}")
+        return existing
+    
     def filter_links(self, links: List[str]) -> List[str]:
         """Фильтрует ссылки: security=reality, port=443, уникальные хосты, не в карантине"""
         filtered = []
@@ -177,10 +192,6 @@ class VlessChecker:
             seen_hosts.add(host)
             
             filtered.append(link)
-            
-            # Ограничиваем количество для быстродействия
-            if len(filtered) >= 100:
-                break
         
         logger.info(f"Отфильтровано {len(filtered)} ссылок (уникальные хосты, без карантина)")
         return filtered
@@ -383,15 +394,56 @@ class VlessChecker:
         return self.working_results
     
     def save_working_links(self, working_links: List[Tuple[str, float, str]]):
-        sorted_links = sorted(working_links, key=lambda x: x[1])
-        top_30 = sorted_links[:STAGE1_WORKING_COUNT]
+        """
+        Сохраняет 30 лучших ссылок, добавляя их к существующим
+        без дубликатов
+        """
+        # Загружаем существующие ссылки
+        existing = self.load_existing_links()
         
+        # Сортируем новые ссылки по пингу
+        sorted_links = sorted(working_links, key=lambda x: x[1])
+        
+        # Собираем все ссылки: существующие + новые
+        all_links = {}
+        
+        # Добавляем существующие (без пинга - они уже были проверены ранее)
+        for link in existing:
+            all_links[link] = {'ping': None, 'is_new': False}
+        
+        # Добавляем новые ссылки
+        for link, ping, status in sorted_links:
+            if link in all_links:
+                # Обновляем пинг для существующей ссылки
+                all_links[link] = {'ping': ping, 'is_new': False}
+            else:
+                all_links[link] = {'ping': ping, 'is_new': True}
+        
+        # Преобразуем в список
+        combined = []
+        for link, info in all_links.items():
+            if info['ping'] is not None:
+                combined.append((link, info['ping']))
+            else:
+                # Для существующих ссылок без пинга - используем большой пинг
+                combined.append((link, 999999))
+        
+        # Сортируем по пингу
+        combined.sort(key=lambda x: x[1])
+        
+        # Берём 30 лучших
+        top_30 = combined[:STAGE1_WORKING_COUNT]
+        
+        # Сохраняем
         with open(WORKING_LINKS_FILE, 'w', encoding='utf-8') as f:
-            for link, ping, status in top_30:
+            for link, ping in top_30:
                 f.write(f"{link}\n")
         
-        logger.info(f"Сохранено {len(top_30)} лучших ссылок (HTTPS, {TEST_HOST}) в {WORKING_LINKS_FILE}")
-        logger.info(f"Пинги сохранённых: {[f'{ping:.0f}' for link, ping, status in top_30]}")
+        new_count = len([l for l, _ in top_30 if all_links.get(l, {}).get('is_new', False)])
+        old_count = len(top_30) - new_count
+        
+        logger.info(f"Сохранено {len(top_30)} лучших ссылок в {WORKING_LINKS_FILE}")
+        logger.info(f"  Новых: {new_count}, Существующих: {old_count}")
 
 def main():
     logger.info("="*60)
@@ -428,7 +480,7 @@ def main():
         
         logger.info("="*60)
         logger.info("✅ ЭТАП 1 ЗАВЕРШЕН")
-        logger.info(f"📁 30 лучших ссылок (уникальные хосты) сохранены в: {WORKING_LINKS_FILE}")
+        logger.info(f"📁 Лучшие ссылки сохранены в: {WORKING_LINKS_FILE}")
         logger.info("="*60)
         
     except Exception as e:
