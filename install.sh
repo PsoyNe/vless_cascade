@@ -15,11 +15,11 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+print_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
 print_success() { echo -e "${GREEN}[OK]${NC} $1"; }
-print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+print_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-print_header() { echo ""; echo "============================================================"; echo " $1"; echo "============================================================"; echo ""; }
+print_header()  { echo ""; echo "============================================================"; echo " $1"; echo "============================================================"; echo ""; }
 
 # ============================================================
 # ПРОВЕРКА ПРАВ
@@ -76,8 +76,8 @@ if ! command -v x-ui &> /dev/null; then
     echo ""
     echo "  bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)"
     echo ""
-    print_warning "Или установите вручную и настройте outbound'ы:"
-    echo "  vless_1, vless_2, ... vless_10"
+    print_warning "После установки создайте в панели исходящее соединение с тегом vless_obs,"
+    print_warning "а затем запустите install.sh заново."
     echo ""
     read -p "Продолжить установку? (y/n): " -n 1 -r
     echo ""
@@ -86,47 +86,76 @@ if ! command -v x-ui &> /dev/null; then
     fi
 else
     print_success "3x-ui найден"
+
+    if systemctl is-active --quiet x-ui; then
+        print_success "Служба x-ui работает"
+    else
+        print_warning "Служба x-ui не запущена. Запустите: systemctl start x-ui"
+    fi
 fi
 
 # ============================================================
-# УСТАНОВКА VLESS CHECKER (Alpha)
+# СКАЧИВАНИЕ ФАЙЛОВ ИЗ GITHUB
 # ============================================================
-print_header "УСТАНОВКА VLESS CHECKER (Alpha)"
+GITHUB_RAW="https://raw.githubusercontent.com/PsoyNe/vless_cascade/refs/heads/main"
+
+download_file() {
+    local url="$1"
+    local dest="$2"
+    local name="$3"
+
+    print_info "Скачивание: $name"
+    if ! wget -q "$url" -O "$dest" 2>/dev/null; then
+        print_error "Не удалось скачать: $name"
+        return 1
+    fi
+    if [ ! -s "$dest" ]; then
+        print_error "Файл пустой: $name (возможно, не существует в репозитории)"
+        rm -f "$dest"
+        return 1
+    fi
+    return 0
+}
+
+# ============================================================
+# УСТАНОВКА VLESS CHECKER (Этап 1)
+# ============================================================
+print_header "УСТАНОВКА VLESS CHECKER (Этап 1)"
 
 CHECKER_DIR="/root/vless_checker"
-GITHUB_RAW="https://raw.githubusercontent.com/PsoyNe/vless_cascade/refs/heads/main"
 
 if [ -d "$CHECKER_DIR" ]; then
     print_warning "Директория $CHECKER_DIR уже существует"
     read -p "Перезаписать файлы? (y/n): " -n 1 -r
     echo ""
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        print_info "Установка чекера пропущена"
-    else
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
         rm -rf "$CHECKER_DIR"
-        mkdir -p "$CHECKER_DIR"
-        cd "$CHECKER_DIR"
-        
-        # Скачиваем файлы чекера
-        for file in vless_check_config.py vless_checker.py server_tester.py full_check.py run_stage1.sh run_stage2.sh run_full_check.sh; do
-            print_info "Скачивание: $file"
-            wget -q "$GITHUB_RAW/$file" -O "$file"
-        done
-        
-        chmod +x *.py *.sh 2>/dev/null
-        print_success "VLESS Checker установлен"
+    else
+        print_info "Установка чекера пропущена"
+        CHECKER_SKIP=1
     fi
-else
+fi
+
+if [ -z "$CHECKER_SKIP" ]; then
     mkdir -p "$CHECKER_DIR"
     cd "$CHECKER_DIR"
-    
-    for file in vless_check_config.py vless_checker.py server_tester.py full_check.py run_stage1.sh run_stage2.sh run_full_check.sh; do
-        print_info "Скачивание: $file"
-        wget -q "$GITHUB_RAW/$file" -O "$file"
+
+    # Основные файлы этапа 1
+    CHECKER_FILES="vless_check_config.py vless_checker.py server_tester.py"
+    # Скрипты запуска
+    CHECKER_SCRIPTS="run_stage1.sh run_stage2.sh run_full_check.sh"
+
+    for file in $CHECKER_FILES $CHECKER_SCRIPTS; do
+        download_file "$GITHUB_RAW/$file" "$CHECKER_DIR/$file" "$file" || true
     done
-    
-    chmod +x *.py *.sh 2>/dev/null
-    print_success "VLESS Checker установлен"
+
+    # Создаём пустые файлы данных, чтобы observer не падал при старте
+    touch "$CHECKER_DIR/working_links.txt"
+    touch "$CHECKER_DIR/stable_links.txt"
+    touch "$CHECKER_DIR/quarantine_links.txt"
+
+    chmod +x *.py *.sh 2>/dev/null || true
+    print_success "VLESS Checker установлен в $CHECKER_DIR"
 fi
 
 # ============================================================
@@ -140,28 +169,26 @@ if [ -d "$OBSERVER_DIR" ]; then
     print_warning "Директория $OBSERVER_DIR уже существует"
     read -p "Перезаписать файлы? (y/n): " -n 1 -r
     echo ""
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        print_info "Установка обсерватории пропущена"
-    else
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
         rm -rf "$OBSERVER_DIR"
-        mkdir -p "$OBSERVER_DIR"
-        cd "$OBSERVER_DIR"
-        
-        wget -q "$GITHUB_RAW/observer_config.py" -O observer_config.py
-        wget -q "$GITHUB_RAW/observer.py" -O observer.py
-        
-        chmod +x observer.py
-        print_success "VLESS Observer установлен"
+    else
+        print_info "Установка обсерватории пропущена"
+        OBSERVER_SKIP=1
     fi
-else
+fi
+
+if [ -z "$OBSERVER_SKIP" ]; then
     mkdir -p "$OBSERVER_DIR"
     cd "$OBSERVER_DIR"
-    
-    wget -q "$GITHUB_RAW/observer_config.py" -O observer_config.py
-    wget -q "$GITHUB_RAW/observer.py" -O observer.py
-    
-    chmod +x observer.py
-    print_success "VLESS Observer установлен"
+
+    OBSERVER_FILES="observer_config.py observer.py show_logs.sh run_observer.sh"
+
+    for file in $OBSERVER_FILES; do
+        download_file "$GITHUB_RAW/$file" "$OBSERVER_DIR/$file" "$file" || true
+    done
+
+    chmod +x *.py *.sh 2>/dev/null || true
+    print_success "VLESS Observer установлен в $OBSERVER_DIR"
 fi
 
 # ============================================================
@@ -169,19 +196,20 @@ fi
 # ============================================================
 print_header "НАСТРОЙКА CRON ДЛЯ ЧЕКЕРА"
 
-CRON_JOB_CHECKER="0 2 * * * /root/vless_checker/run_full_check.sh"
+# Этап 1 запускается 4 раза в сутки: 01:00, 07:00, 13:00, 19:00
+CRON_JOB='0 1,7,13,19 * * * /usr/bin/python3 /root/vless_checker/vless_checker.py >> /var/log/vless_checker_cron.log 2>&1'
 
 if crontab -l 2>/dev/null | grep -q "vless_checker"; then
     print_warning "Cron задание для чекера уже существует"
     read -p "Перезаписать? (y/n): " -n 1 -r
     echo ""
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        (crontab -l 2>/dev/null | grep -v "vless_checker"; echo "$CRON_JOB_CHECKER") | crontab -
+        (crontab -l 2>/dev/null | grep -v "vless_checker"; echo "$CRON_JOB") | crontab -
         print_success "Cron задание для чекера обновлено"
     fi
 else
-    (crontab -l 2>/dev/null; echo "$CRON_JOB_CHECKER") | crontab -
-    print_success "Cron задание для чекера добавлено"
+    (crontab -l 2>/dev/null; echo "$CRON_JOB") | crontab -
+    print_success "Cron задание для чекера добавлено (01:00, 07:00, 13:00, 19:00)"
 fi
 
 # ============================================================
@@ -200,12 +228,18 @@ Type=simple
 User=root
 WorkingDirectory=/root/vless_observer
 ExecStart=/usr/bin/python3 /root/vless_observer/observer.py
-ExecReload=/bin/kill -HUP $MAINPID
+
+# Graceful shutdown через SIGTERM (обрабатывается в observer.py)
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
 Restart=always
 RestartSec=10
-StandardOutput=append:/var/log/vless_observer.log
-StandardError=append:/var/log/vless_observer.log
-PIDFile=/var/run/vless_observer.pid
+
+# Логи пишет сам Python через TimedRotatingFileHandler.
+# systemd не должен дублировать их в тот же файл.
+StandardOutput=null
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -240,7 +274,15 @@ print_info "Проверка Python модулей..."
 if python3 -c "import requests, socks, ssl, sqlite3" 2>/dev/null; then
     print_success "Все модули установлены"
 else
-    print_warning "Некоторые модули отсутствуют"
+    print_warning "Некоторые модули отсутствуют. Установите: pip3 install requests pysocks"
+fi
+
+print_info "Проверка Xray..."
+if [ -f /usr/local/x-ui/bin/xray-linux-arm32 ]; then
+    print_success "Xray найден: /usr/local/x-ui/bin/xray-linux-arm32"
+else
+    print_warning "Xray не найден по пути /usr/local/x-ui/bin/xray-linux-arm32"
+    print_warning "Проверьте путь в vless_check_config.py и observer_config.py (XRAY_PATH)"
 fi
 
 # ============================================================
@@ -248,25 +290,41 @@ fi
 # ============================================================
 print_header "УСТАНОВКА ЗАВЕРШЕНА"
 
-echo "📁 VLESS Checker: /root/vless_checker/"
+echo "📁 VLESS Checker:  /root/vless_checker/"
 echo "📁 VLESS Observer: /root/vless_observer/"
 echo ""
-echo "⏰ Cron задание:"
+echo "⏰ Cron задание (этап 1, 4 раза в сутки):"
 crontab -l | grep vless_checker || echo "  Не найдено"
 echo ""
 echo "🔄 Служба Observer:"
-systemctl status vless_observer --no-pager
+systemctl status vless_observer --no-pager | head -15
 echo ""
 echo "🚀 Запуск вручную:"
-echo "  VLESS Checker: cd /root/vless_checker && python3 full_check.py"
-echo "  VLESS Observer: systemctl start vless_observer"
+echo "  Этап 1 (сбор 30 ссылок):"
+echo "    cd /root/vless_checker && nohup python3 vless_checker.py > /dev/null 2>&1 &"
+echo "    tail -f /var/log/vless_checker.log"
+echo ""
+echo "  Observer:"
+echo "    systemctl start vless_observer"
+echo "    tail -f /var/log/vless_observer.log"
 echo ""
 echo "📊 Логи:"
-echo "  tail -f /var/log/vless_full.log"
-echo "  tail -f /var/log/vless_observer.log"
+echo "  tail -f /var/log/vless_checker.log      # этап 1"
+echo "  tail -f /var/log/vless_observer.log     # observer"
+echo "  tail -f /var/log/vless_checker_cron.log # запуск из cron (обёртка)"
 echo ""
-echo "🔧 Триггер Observer (имитация отказа):"
-echo "  touch /tmp/vless_observer_trigger"
+echo "🔧 Триггеры Observer:"
+echo "  touch /tmp/vless_observer_trigger    # имитация отказа"
+echo "  touch /tmp/vless_quarantine_trigger  # отправить основную в карантин"
+echo "  touch /tmp/vless_deep_check_trigger  # глубокая проверка"
+echo ""
+echo "📋 Просмотр логов через меню:"
+echo "  bash /root/vless_observer/show_logs.sh"
+echo ""
+
+print_warning "ВАЖНО: Первый запуск этапа 1 соберёт 30 ссылок в working_links.txt."
+print_warning "Observer без файла будет ждать — это нормально."
+print_warning "Запустите этап 1 вручную или дождитесь cron (01:00, 07:00, 13:00, 19:00)."
 echo ""
 
 print_success "✅ Готово!"
