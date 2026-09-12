@@ -13,6 +13,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 print_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -20,6 +21,94 @@ print_success() { echo -e "${GREEN}[OK]${NC} $1"; }
 print_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 print_header()  { echo ""; echo "============================================================"; echo " $1"; echo "============================================================"; echo ""; }
+
+# ============================================================
+# ПРОГРЕСС-БАР
+# ============================================================
+# Использование:
+#   progress_bar_init "Скачивание" 12
+#   progress_bar_step "vless_checker.py"
+#   ...
+#   progress_bar_finish
+
+PROGRESS_TOTAL=0
+PROGRESS_CURRENT=0
+PROGRESS_LABEL=""
+PROGRESS_WIDTH=30
+
+progress_bar_init() {
+    PROGRESS_LABEL="$1"
+    PROGRESS_TOTAL="$2"
+    PROGRESS_CURRENT=0
+}
+
+progress_bar_step() {
+    PROGRESS_CURRENT=$((PROGRESS_CURRENT + 1))
+    if [ "$PROGRESS_TOTAL" -le 0 ]; then
+        return
+    fi
+
+    local percent=$((PROGRESS_CURRENT * 100 / PROGRESS_TOTAL))
+    local filled=$((PROGRESS_CURRENT * PROGRESS_WIDTH / PROGRESS_TOTAL))
+    local empty=$((PROGRESS_WIDTH - filled))
+
+    local bar=""
+    for ((i=0; i<filled; i++)); do bar="${bar}█"; done
+    for ((i=0; i<empty; i++)); do bar="${bar}░"; done
+
+    local item="${1:-}"
+    # Обрезаем item до 40 символов, чтобы не ломать строку
+    if [ ${#item} -gt 40 ]; then
+        item="${item:0:37}..."
+    fi
+
+    printf "\r${CYAN}%s${NC} [%s] %3d%% %-40s" \
+        "$PROGRESS_LABEL" "$bar" "$percent" "$item"
+}
+
+progress_bar_finish() {
+    if [ "$PROGRESS_TOTAL" -le 0 ]; then
+        echo ""
+        return
+    fi
+    local bar=""
+    for ((i=0; i<PROGRESS_WIDTH; i++)); do bar="${bar}█"; done
+    printf "\r${GREEN}%s${NC} [%s] 100%% %-40s\n" \
+        "$PROGRESS_LABEL" "$bar" "Готово"
+}
+
+# Анимированный прогресс для операций без известного количества шагов
+# Использование:
+#   animate_start "Установка пакетов"
+#   <долгая операция>
+#   animate_stop
+ANIMATE_PID=""
+
+animate_start() {
+    local label="$1"
+    (
+        local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+        local i=0
+        while true; do
+            i=$(( (i+1) % ${#spin} ))
+            printf "\r${CYAN}%s${NC} %s" "$label" "${spin:$i:1}"
+            sleep 0.1
+        done
+    ) &
+    ANIMATE_PID=$!
+}
+
+animate_stop() {
+    if [ -n "$ANIMATE_PID" ]; then
+        kill "$ANIMATE_PID" 2>/dev/null || true
+        wait "$ANIMATE_PID" 2>/dev/null || true
+        printf "\r\033[K"   # очищаем строку
+        ANIMATE_PID=""
+    fi
+}
+
+# Гарантированная очистка анимации при выходе
+trap 'animate_stop' EXIT
 
 # ============================================================
 # ПРОВЕРКА ПРАВ
@@ -46,24 +135,26 @@ fi
 # ============================================================
 print_header "УСТАНОВКА ЗАВИСИМОСТЕЙ"
 
-print_info "Обновление пакетов..."
-apt-get update -qq
+print_info "Обновление пакетов (apt-get update)..."
+animate_start "apt-get update"
+apt-get update -qq > /dev/null 2>&1
+animate_stop
+print_success "Списки пакетов обновлены"
 
 print_info "Установка необходимых пакетов..."
-apt-get install -y -qq \
-    python3 \
-    python3-pip \
-    python3-venv \
-    wget \
-    curl \
-    unzip \
-    sqlite3 \
-    jq \
-    > /dev/null 2>&1
+PACKAGES="python3 python3-pip python3-venv wget curl unzip sqlite3 jq"
+progress_bar_init "Пакеты" 8
 
-print_info "Установка Python модулей..."
+for pkg in $PACKAGES; do
+    progress_bar_step "$pkg"
+    apt-get install -y -qq "$pkg" > /dev/null 2>&1 || true
+done
+progress_bar_finish
+
+print_info "Установка Python-модулей (requests, pysocks)..."
+animate_start "pip3 install"
 pip3 install requests pysocks --break-system-packages > /dev/null 2>&1
-
+animate_stop
 print_success "Зависимости установлены"
 
 # ============================================================
@@ -104,7 +195,6 @@ download_file() {
     local dest="$2"
     local name="$3"
 
-    print_info "Скачивание: $name"
     if ! wget -q "$url" -O "$dest" 2>/dev/null; then
         print_error "Не удалось скачать: $name"
         return 1
@@ -138,23 +228,26 @@ fi
 
 if [ -z "$CHECKER_SKIP" ]; then
     mkdir -p "$CHECKER_DIR"
-    cd "$CHECKER_DIR"
 
-    # Основные файлы этапа 1
-    CHECKER_FILES="vless_check_config.py vless_checker.py server_tester.py"
-    # Скрипты запуска
-    CHECKER_SCRIPTS="run_stage1.sh run_stage2.sh run_full_check.sh"
+    # Основные файлы этапа 1 + скрипты
+    CHECKER_FILES="vless_check_config.py vless_checker.py server_tester.py run_stage1.sh run_stage2.sh run_full_check.sh"
 
-    for file in $CHECKER_FILES $CHECKER_SCRIPTS; do
+    # Считаем количество для прогресса
+    NUM_CHECKER_FILES=$(echo "$CHECKER_FILES" | wc -w)
+    progress_bar_init "Checker" "$NUM_CHECKER_FILES"
+
+    for file in $CHECKER_FILES; do
         download_file "$GITHUB_RAW/$file" "$CHECKER_DIR/$file" "$file" || true
+        progress_bar_step "$file"
     done
+    progress_bar_finish
 
     # Создаём пустые файлы данных, чтобы observer не падал при старте
     touch "$CHECKER_DIR/working_links.txt"
     touch "$CHECKER_DIR/stable_links.txt"
     touch "$CHECKER_DIR/quarantine_links.txt"
 
-    chmod +x *.py *.sh 2>/dev/null || true
+    chmod +x "$CHECKER_DIR"/*.py "$CHECKER_DIR"/*.sh 2>/dev/null || true
     print_success "VLESS Checker установлен в $CHECKER_DIR"
 fi
 
@@ -179,15 +272,18 @@ fi
 
 if [ -z "$OBSERVER_SKIP" ]; then
     mkdir -p "$OBSERVER_DIR"
-    cd "$OBSERVER_DIR"
 
     OBSERVER_FILES="observer_config.py observer.py show_logs.sh run_observer.sh"
+    NUM_OBSERVER_FILES=$(echo "$OBSERVER_FILES" | wc -w)
+    progress_bar_init "Observer" "$NUM_OBSERVER_FILES"
 
     for file in $OBSERVER_FILES; do
         download_file "$GITHUB_RAW/$file" "$OBSERVER_DIR/$file" "$file" || true
+        progress_bar_step "$file"
     done
+    progress_bar_finish
 
-    chmod +x *.py *.sh 2>/dev/null || true
+    chmod +x "$OBSERVER_DIR"/*.py "$OBSERVER_DIR"/*.sh 2>/dev/null || true
     print_success "VLESS Observer установлен в $OBSERVER_DIR"
 fi
 
@@ -217,6 +313,7 @@ fi
 # ============================================================
 print_header "НАСТРОЙКА СЛУЖБЫ OBSERVER"
 
+print_info "Создание systemd-юнита..."
 cat > /etc/systemd/system/vless_observer.service << 'EOF'
 [Unit]
 Description=VLESS Observer - automatic outbound monitoring and switching
@@ -244,10 +341,20 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
+print_success "Юнит создан"
 
+print_info "Активация и запуск службы..."
+animate_start "systemctl daemon-reload"
 systemctl daemon-reload
-systemctl enable vless_observer
+animate_stop
+
+animate_start "systemctl enable"
+systemctl enable vless_observer > /dev/null 2>&1
+animate_stop
+
+animate_start "systemctl start"
 systemctl start vless_observer
+animate_stop
 
 print_success "Служба Observer запущена"
 
