@@ -15,6 +15,7 @@ CHECKER_DIR="/root/vless_checker"
 OBSERVER_DIR="/root/vless_observer"
 VERSION_FILE_LOCAL="/root/.vless_cascade_version"
 UPDATE_SCRIPT_PATH="/root/update.sh"
+MERGE_SCRIPT_PATH="/root/merge_config.py"
 
 # ============================================================
 # ЦВЕТА ДЛЯ ВЫВОДА
@@ -81,7 +82,7 @@ progress_bar_finish() {
 }
 
 # ============================================================
-# АНИМАЦИЯ (спиннер) для операций без прогресса
+# АНИМАЦИЯ (спиннер)
 # ============================================================
 ANIMATE_PID=""
 
@@ -297,10 +298,11 @@ if [ -z "$OBSERVER_SKIP" ]; then
 fi
 
 # ============================================================
-# СКАЧИВАНИЕ UPDATE.SH
+# СКАЧИВАНИЕ UPDATE.SH И MERGE_CONFIG.PY
 # ============================================================
-print_header "УСТАНОВКА СКРИПТА ОБНОВЛЕНИЯ"
+print_header "УСТАНОВКА СКРИПТОВ ОБСЛУЖИВАНИЯ"
 
+# update.sh
 print_info "Скачиваем update.sh..."
 if download_file "$GITHUB_RAW/update.sh" "$UPDATE_SCRIPT_PATH" "update.sh"; then
     chmod +x "$UPDATE_SCRIPT_PATH"
@@ -308,6 +310,16 @@ if download_file "$GITHUB_RAW/update.sh" "$UPDATE_SCRIPT_PATH" "update.sh"; then
 else
     print_warning "Не удалось скачать update.sh"
     print_warning "Автообновление будет недоступно."
+fi
+
+# merge_config.py
+print_info "Скачиваем merge_config.py..."
+if download_file "$GITHUB_RAW/merge_config.py" "$MERGE_SCRIPT_PATH" "merge_config.py"; then
+    chmod +x "$MERGE_SCRIPT_PATH"
+    print_success "merge_config.py установлен: $MERGE_SCRIPT_PATH"
+else
+    print_warning "Не удалось скачать merge_config.py"
+    print_warning "При обновлении конфиги не будут сливаться — придётся обновлять вручную."
 fi
 
 # ============================================================
@@ -430,6 +442,13 @@ else
     print_warning "Скрипт обновления недоступен"
 fi
 
+print_info "Проверка merge_config.py..."
+if [ -f "$MERGE_SCRIPT_PATH" ] && [ -x "$MERGE_SCRIPT_PATH" ]; then
+    print_success "Скрипт слияния конфигов готов"
+else
+    print_warning "Скрипт слияния конфигов недоступен"
+fi
+
 # ============================================================
 # ИТОГ
 # ============================================================
@@ -441,6 +460,7 @@ echo "📁 VLESS Checker:  $CHECKER_DIR"
 echo "📁 VLESS Observer: $OBSERVER_DIR"
 echo "📄 Файл версии:    $VERSION_FILE_LOCAL"
 echo "🔄 Скрипт обновления: $UPDATE_SCRIPT_PATH"
+echo "🔀 Скрипт слияния:    $MERGE_SCRIPT_PATH"
 echo ""
 echo "⏰ Cron задание (этап 1, 4 раза в сутки, с flock):"
 crontab -l | grep vless_checker || echo "  Не найдено"
