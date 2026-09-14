@@ -584,58 +584,198 @@ class VlessObserver:
             logger.error(f"Ошибка загрузки карантина: {e}")
         return quarantine
 
-    def init_pool(self):
-        with self.primary_lock:
-            self.primary = self.links[0]
+    def _find_working_primary(self) -> Optional[str]:
+        """
+        Перебирает ссылки из self.links и возвращает ПЕРВУЮ ЖИВУЮ.
+        Мёртвые добавляет в dead_links. Проверяет через PROXY_PORT_PRIMARY.
+        Возвращает None, если ни одна не работает.
+        """
+        total = len(self.links)
+        logger.info(f"🔍 Проверяем ссылки при старте (до первой живой, максимум {total})...")
 
-        parsed_primary = parse_vless_link(self.primary)
-        if not parsed_primary:
-            logger.error("❌ Не удалось распарсить основную ссылку!")
-            return
+        for i, link in enumerate(self.links, 1):
+            if _shutdown_requested.is_set():
+                return None
 
-        ok, reason = validate_reality_params(parsed_primary['params'])
-        if not ok:
-            logger.error(f"❌ Основная ссылка невалидна: {reason}")
-            return
+            parsed = parse_vless_link(link)
+            if not parsed:
+                with self.dead_links_lock:
+                    self.dead_links.add(link)
+                logger.warning(f"⚠️ [{i}/{total}] Не удалось распарсить ссылку")
+                continue
+
+            host = parsed['host']
+
+            ok, reason = validate_reality_params(parsed['params'])
+            if not ok:
+                with self.dead_links_lock:
+                    self.dead_links.add(link)
+                logger.warning(f"⚠️ [{i}/{total}] {host} — невалидная Reality: {reason}")
+                continue
+
+            logger.info(f"🔎 [{i}/{total}] Проверяем {host}...")
+
+            is_working, ping, _ = test_link_through_xray(
+                link,
+                PROXY_PORT_PRIMARY,
+                timeout=TEST_TIMEOUT
+            )
+
+            if is_working:
+                logger.info(f"✅ [{i}/{total}] {host} живая! Пинг: {ping:.0f}мс — будет основной")
+                return link
+            else:
+                with self.dead_links_lock:
+                    self.dead_links.add(link)
+                logger.warning(f"❌ [{i}/{total}] {host} мертва — пропускаем")
+
+        return None
+
+    def _fill_backup_pool(self):
+        """
+        Набирает backup_pool из self.links. Пропускает:
+        - текущую основную
+        - уже в dead_links
+        - уже в deferred_links
+        - карантин
+        Каждая ссылка проверяется через PROXY_PORT_BACKUP.
+        Мёртвые → в deferred. Живые → в пул.
+        """
+        quarantine = self.load_quarantine()
 
         with self.pool_lock:
-            self.backup_pool = []
-            for link in self.links[1:]:
-                parsed = parse_vless_link(link)
-                if not parsed:
-                    continue
-                ok, reason = validate_reality_params(parsed['params'])
-                if not ok:
-                    logger.warning(f"⚠️ Пропуск невалидной ссылки {parsed['host']}: {reason}")
-                    with self.dead_links_lock:
-                        self.dead_links.add(link)
-                    continue
-                self.backup_pool.append({
-                    'link': link,
-                    'host': parsed['host'],
-                    'alive': True,
-                    'ping': 0
-                })
-                if len(self.backup_pool) >= BACKUP_POOL_SIZE:
-                    break
+            existing_links = set(item['link'] for item in self.backup_pool)
+        with self.deferred_lock:
+            deferred_set = set(self.deferred_links.keys())
+        with self.dead_links_lock:
+            dead_set = set(self.dead_links)
+        with self.primary_lock:
+            current_primary = self.primary
 
+        # Кандидаты на резерв — все, кроме текущей основной и уже исключённых
+        candidates = [
+            l for l in self.links
+            if l != current_primary
+            and l not in existing_links
+            and l not in deferred_set
+            and l not in dead_set
+            and l not in quarantine
+        ]
+
+        logger.info(f"🔍 Набираем резерв (цель: {BACKUP_POOL_SIZE}), кандидатов: {len(candidates)}")
+
+        added = 0
+        checked = 0
+
+        for link in candidates:
+            if _shutdown_requested.is_set():
+                return
+            if added >= BACKUP_POOL_SIZE:
+                break
+
+            checked += 1
+            parsed = parse_vless_link(link)
+            if not parsed:
+                with self.dead_links_lock:
+                    self.dead_links.add(link)
+                continue
+
+            host = parsed['host']
+
+            ok, reason = validate_reality_params(parsed['params'])
+            if not ok:
+                with self.dead_links_lock:
+                    self.dead_links.add(link)
+                continue
+
+            logger.info(f"🔎 Резерв [{added + 1}/{BACKUP_POOL_SIZE}] проверяем {host}...")
+
+            is_working, ping, _ = test_link_through_xray(
+                link,
+                PROXY_PORT_BACKUP,
+                timeout=BACKUP_TEST_TIMEOUT
+            )
+
+            if is_working:
+                with self.pool_lock:
+                    self.backup_pool.append({
+                        'link': link,
+                        'host': host,
+                        'alive': True,
+                        'ping': ping
+                    })
+                added += 1
+                logger.info(f"✅ Резерв [{added}/{BACKUP_POOL_SIZE}] {host} (пинг: {ping:.0f}мс)")
+            else:
+                # Мёртвая — в deferred
+                current_time = time.time()
+                with self.deferred_lock:
+                    self.deferred_links[link] = {
+                        'deferred_at': current_time,
+                        'last_checked_at': current_time,
+                    }
+                logger.warning(f"❌ Резерв {host} мертва — в deferred")
+
+        if added < BACKUP_POOL_SIZE:
+            logger.warning(f"⚠️ Набрано только {added}/{BACKUP_POOL_SIZE} резервных. "
+                          f"Проверено кандидатов: {checked}. Остальные — мёртвые или не хватило.")
+
+    def init_pool(self) -> bool:
+        """
+        Инициализация пула при старте.
+
+        Возвращает:
+            True  — нашли живую основную, работаем.
+            False — живых нет, надо ждать (wait_for_links).
+        """
+        # ШАГ 1: ищем живую основную
+        primary = self._find_working_primary()
+
+        if not primary:
+            logger.critical("🔴 НЕТ РАБОЧИХ ССЫЛОК в файле! Все проверенные — мертвы.")
+            logger.critical("Ждём обновления от чекера (cron)...")
+            return False
+
+        with self.primary_lock:
+            self.primary = primary
+
+        parsed_primary = parse_vless_link(primary)
         primary_host = parsed_primary['host']
-        logger.info(f"Установка основной: {primary_host}")
 
-        if update_3xui_outbound(self.primary, OUTBOUND_NAME):
-            reload_xray()
+        # ШАГ 2: ставим основную в 3x-ui
+        logger.info(f"📝 Устанавливаем основную в outbound: {primary_host}")
 
-        logger.info(f"Резерв: {len(self.backup_pool)} ссылок")
-        for item in self.backup_pool:
-            logger.info(f"  - {item['host']}")
+        if not update_3xui_outbound(self.primary, OUTBOUND_NAME):
+            logger.error("❌ Не удалось обновить outbound. Продолжаем без перезапуска x-ui.")
+
+        if not reload_xray():
+            logger.error("❌ Не удалось перезапустить x-ui.")
+
+        # ШАГ 3: набираем резерв
+        self._fill_backup_pool()
+
+        # ШАГ 4: логируем итог
+        with self.pool_lock:
+            total_backup = len(self.backup_pool)
+            alive_count = len([item for item in self.backup_pool if item.get('alive', False)])
+        with self.deferred_lock:
+            deferred_count = len(self.deferred_links)
+        with self.dead_links_lock:
+            dead_count = len(self.dead_links)
+
+        logger.info(f"✅ Основная: {primary_host}")
+        logger.info(f"✅ Резерв: {alive_count}/{total_backup}")
+        logger.info(f"⏸️ В deferred: {deferred_count}")
+        logger.info(f"🗑️ Помечено мёртвыми: {dead_count}")
 
         self.last_primary_host = primary_host
-        self.last_state = f"OK | основная: {primary_host} | резерв: {len(self.backup_pool)}"
+        self.last_state = f"OK | основная: {primary_host} | резерв: {alive_count}/{total_backup}"
         self.last_log_time = time.time()
-        logger.info(self.last_state)
         self.critical_error_logged = False
         self.last_pool_refill_time = time.time()
         self.last_pool_update_time = time.time()
+
+        return True
 
     # --------------------------------------------------------
     # Логирование статуса
@@ -806,7 +946,6 @@ class VlessObserver:
             current_time = time.time()
             with self.deferred_lock:
                 for link in dead_links:
-                    # Структура: {'deferred_at': ..., 'last_checked_at': ...}
                     self.deferred_links[link] = {
                         'deferred_at': current_time,
                         'last_checked_at': current_time,
@@ -871,9 +1010,6 @@ class VlessObserver:
             to_delete = []
             original = dict(self.deferred_links)
 
-        # Определяем, кого проверять и кого удалять
-        # - total_elapsed >= DEAD_LINK_DELETE_AFTER (2 часа) → удалить
-        # - since_last_check >= DEAD_LINK_RETRY_INTERVAL (10 минут) → проверить
         for link, info in original.items():
             deferred_at = info['deferred_at']
             last_checked_at = info['last_checked_at']
@@ -886,7 +1022,6 @@ class VlessObserver:
             elif since_last_check >= DEAD_LINK_RETRY_INTERVAL:
                 to_check.append(link)
 
-        # Удаление отложенных, не оживших за 2 часа
         if to_delete:
             with self.deferred_lock:
                 for link in to_delete:
@@ -900,7 +1035,6 @@ class VlessObserver:
                 host = parsed['host'] if parsed else 'unknown'
                 logger.warning(f"🗑️ Ссылка {host} не ожила за 2 часа — удалена из пула")
 
-        # Перепроверка отложенных
         if to_check:
             logger.info(f"🔄 Проверяем {len(to_check)} отложенных ссылок...")
 
@@ -924,12 +1058,10 @@ class VlessObserver:
                     total_elapsed_min = int((current_time - info['deferred_at']) / 60)
 
                 if is_working:
-                    # Ссылка ожила — убираем из deferred
                     with self.deferred_lock:
                         if link in self.deferred_links:
                             del self.deferred_links[link]
 
-                    # Убираем из dead_links (если она там была — теперь живая)
                     with self.dead_links_lock:
                         self.dead_links.discard(link)
 
@@ -948,8 +1080,6 @@ class VlessObserver:
                         else:
                             logger.info(f"↩️ Ссылка {host} ожила, но пул полный — возвращена в общий оборот")
                 else:
-                    # Ссылка всё ещё мертва — обновляем last_checked_at
-                    # (deferred_at НЕ трогаем — он для удаления через 2 часа)
                     with self.deferred_lock:
                         if link in self.deferred_links:
                             self.deferred_links[link]['last_checked_at'] = time.time()
@@ -1290,16 +1420,31 @@ class VlessObserver:
         logger.info("🚀 VLESS OBSERVER (multi-threaded)")
         logger.info("="*50)
 
-        while not self.load_links():
+        # Ищем файл и живую основную в цикле
+        while True:
             if _shutdown_requested.is_set():
                 return
-            if not self.wait_for_links():
-                if _shutdown_requested.is_set():
-                    return
-                logger.error("❌ Не удалось дождаться ссылок")
-                time.sleep(60)
 
-        self.init_pool()
+            if not self.load_links():
+                if not self.wait_for_links():
+                    if _shutdown_requested.is_set():
+                        return
+                    logger.error("❌ Не удалось дождаться ссылок")
+                    time.sleep(60)
+                continue
+
+            # Файл есть — пробуем инициализировать пул
+            if self.init_pool():
+                break
+            else:
+                # Нет живых ссылок — ждём обновления от чекера
+                logger.info("⏳ Ждём обновления файла от чекера (проверка каждые 60 сек)...")
+                for _ in range(60):
+                    if _shutdown_requested.is_set():
+                        return
+                    time.sleep(1)
+                # перезагружаем файл и пробуем снова
+                continue
 
         logger.info(f"Порты: primary={PROXY_PORT_PRIMARY}, backup={PROXY_PORT_BACKUP}, deferred={PROXY_PORT_DEFERRED}")
         logger.info(f"Проверка основной: каждые {CHECK_INTERVAL_PRIMARY}с (timeout {TEST_TIMEOUT}с)")
