@@ -170,7 +170,7 @@ vless_cascade/
 ### Шаг 2. Базовая настройка NanoPi
 
 ```bash
-apt update && sudo apt upgrade -y
+apt update && apt upgrade -y
 ```
 
 Добейтесь безошибочного обновления. Иногда зарубежные репозитории тормозят — можно обновить через VPN.
