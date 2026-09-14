@@ -62,3 +62,25 @@ LOG_ROTATION_BACKUPS = 7
 # -------------------- АТОМАРНОЕ ЧТЕНИЕ ФАЙЛОВ --------------------
 FILE_READ_RETRIES = 3
 FILE_READ_RETRY_DELAY = 0.3
+
+# ============================================================
+# ГЕО ССЫЛОК (добавлено в 1.0.3)
+# ============================================================
+# Определение страны рабочей ссылки и запись в её fragment (#COUNTRY).
+#
+# Использование:
+#   GEO_ENABLED = True  — включено (по умолчанию)
+#   GEO_ENABLED = False — отключено (ссылки сохраняются без гео)
+#
+# Формат:
+#   vless://uuid@host:443?params#DE      — определилось
+#   vless://uuid@host:443?params#UNKNOWN — не определилось, но ссылка рабочая
+#
+# Гео-сервис — Cloudflare trace (простой текстовый ответ, без лимитов):
+#   https://www.cloudflare.com/cdn-cgi/trace
+# В ответе ищется строка "loc=XX" (XX — код страны).
+
+GEO_ENABLED = True
+GEO_URL = "https://www.cloudflare.com/cdn-cgi/trace"
+GEO_TIMEOUT = 5
+GEO_UNKNOWN_MARK = "UNKNOWN"
