@@ -107,6 +107,10 @@ def validate_reality_params(params: dict) -> Tuple[bool, str]:
 
 
 def parse_vless_link(link: str) -> Optional[dict]:
+    """
+    Парсит VLESS-ссылку.
+    Fragment (#COUNTRY) отсекается — в params его нет.
+    """
     try:
         if not link.startswith('vless://'):
             return None
@@ -139,6 +143,40 @@ def parse_vless_link(link: str) -> Optional[dict]:
     except Exception as e:
         logger.error(f"Ошибка парсинга: {e}")
         return None
+
+
+def extract_geo_from_link(link: str) -> str:
+    """
+    Извлекает #COUNTRY из ссылки.
+
+    Возвращает:
+        'DE', 'NL', 'US', ...  — корректный код страны
+        'UNKNOWN'              — если в ссылке #UNKNOWN
+        'N/A'                  — если fragment отсутствует или не распознан
+    """
+    if '#' not in link:
+        return 'N/A'
+    fragment = link.split('#', 1)[1].strip()
+    if not fragment:
+        return 'N/A'
+    if re.match(r'^[A-Z]{2}$', fragment):
+        return fragment
+    if fragment == "UNKNOWN":
+        return "UNKNOWN"
+    return 'N/A'
+
+
+def format_host_with_geo(link: str) -> str:
+    """
+    Возвращает 'host [XX]'.
+    Если ссылка не парсится — 'unknown [N/A]'.
+    """
+    parsed = parse_vless_link(link)
+    if not parsed:
+        return 'unknown [N/A]'
+    host = parsed['host']
+    geo = extract_geo_from_link(link)
+    return f"{host} [{geo}]"
 
 
 def create_xray_config(link: str, proxy_port: int) -> dict:
@@ -579,7 +617,9 @@ class VlessObserver:
                     for line in f:
                         link = line.strip()
                         if link.startswith('vless://'):
-                            quarantine.add(link)
+                            # Отрезаем fragment — сравниваем без гео
+                            base = link.split('#', 1)[0]
+                            quarantine.add(base)
         except Exception as e:
             logger.error(f"Ошибка загрузки карантина: {e}")
         return quarantine
@@ -588,7 +628,6 @@ class VlessObserver:
         """
         Перебирает ссылки из self.links и возвращает ПЕРВУЮ ЖИВУЮ.
         Мёртвые добавляет в dead_links. Проверяет через PROXY_PORT_PRIMARY.
-        Возвращает None, если ни одна не работает.
         """
         total = len(self.links)
         logger.info(f"🔍 Проверяем ссылки при старте (до первой живой, максимум {total})...")
@@ -604,16 +643,16 @@ class VlessObserver:
                 logger.warning(f"⚠️ [{i}/{total}] Не удалось распарсить ссылку")
                 continue
 
-            host = parsed['host']
+            display = format_host_with_geo(link)
 
             ok, reason = validate_reality_params(parsed['params'])
             if not ok:
                 with self.dead_links_lock:
                     self.dead_links.add(link)
-                logger.warning(f"⚠️ [{i}/{total}] {host} — невалидная Reality: {reason}")
+                logger.warning(f"⚠️ [{i}/{total}] {display} — невалидная Reality: {reason}")
                 continue
 
-            logger.info(f"🔎 [{i}/{total}] Проверяем {host}...")
+            logger.info(f"🔎 [{i}/{total}] Проверяем {display}...")
 
             is_working, ping, _ = test_link_through_xray(
                 link,
@@ -622,12 +661,12 @@ class VlessObserver:
             )
 
             if is_working:
-                logger.info(f"✅ [{i}/{total}] {host} живая! Пинг: {ping:.0f}мс — будет основной")
+                logger.info(f"✅ [{i}/{total}] {display} живая! Пинг: {ping:.0f}мс — будет основной")
                 return link
             else:
                 with self.dead_links_lock:
                     self.dead_links.add(link)
-                logger.warning(f"❌ [{i}/{total}] {host} мертва — пропускаем")
+                logger.warning(f"❌ [{i}/{total}] {display} мертва — пропускаем")
 
         return None
 
@@ -639,7 +678,6 @@ class VlessObserver:
         - уже в deferred_links
         - карантин
         Каждая ссылка проверяется через PROXY_PORT_BACKUP.
-        Мёртвые → в deferred. Живые → в пул.
         """
         quarantine = self.load_quarantine()
 
@@ -652,15 +690,19 @@ class VlessObserver:
         with self.primary_lock:
             current_primary = self.primary
 
-        # Кандидаты на резерв — все, кроме текущей основной и уже исключённых
-        candidates = [
-            l for l in self.links
-            if l != current_primary
-            and l not in existing_links
-            and l not in deferred_set
-            and l not in dead_set
-            and l not in quarantine
-        ]
+        # Сравниваем без гео
+        current_primary_base = current_primary.split('#', 1)[0] if current_primary else None
+
+        candidates = []
+        for l in self.links:
+            l_base = l.split('#', 1)[0]
+            if l_base == current_primary_base:
+                continue
+            if l in existing_links:
+                continue
+            if l in deferred_set or l in dead_set or l in quarantine or l_base in quarantine:
+                continue
+            candidates.append(l)
 
         logger.info(f"🔍 Набираем резерв (цель: {BACKUP_POOL_SIZE}), кандидатов: {len(candidates)}")
 
@@ -680,7 +722,8 @@ class VlessObserver:
                     self.dead_links.add(link)
                 continue
 
-            host = parsed['host']
+            display = format_host_with_geo(link)
+            country = extract_geo_from_link(link)
 
             ok, reason = validate_reality_params(parsed['params'])
             if not ok:
@@ -688,7 +731,7 @@ class VlessObserver:
                     self.dead_links.add(link)
                 continue
 
-            logger.info(f"🔎 Резерв [{added + 1}/{BACKUP_POOL_SIZE}] проверяем {host}...")
+            logger.info(f"🔎 Резерв [{added + 1}/{BACKUP_POOL_SIZE}] проверяем {display}...")
 
             is_working, ping, _ = test_link_through_xray(
                 link,
@@ -700,35 +743,28 @@ class VlessObserver:
                 with self.pool_lock:
                     self.backup_pool.append({
                         'link': link,
-                        'host': host,
+                        'host': parsed['host'],
+                        'country': country,
                         'alive': True,
                         'ping': ping
                     })
                 added += 1
-                logger.info(f"✅ Резерв [{added}/{BACKUP_POOL_SIZE}] {host} (пинг: {ping:.0f}мс)")
+                logger.info(f"✅ Резерв [{added}/{BACKUP_POOL_SIZE}] {display} (пинг: {ping:.0f}мс)")
             else:
-                # Мёртвая — в deferred
                 current_time = time.time()
                 with self.deferred_lock:
                     self.deferred_links[link] = {
                         'deferred_at': current_time,
                         'last_checked_at': current_time,
                     }
-                logger.warning(f"❌ Резерв {host} мертва — в deferred")
+                logger.warning(f"❌ Резерв {display} мертва — в deferred")
 
         if added < BACKUP_POOL_SIZE:
             logger.warning(f"⚠️ Набрано только {added}/{BACKUP_POOL_SIZE} резервных. "
-                          f"Проверено кандидатов: {checked}. Остальные — мёртвые или не хватило.")
+                          f"Проверено кандидатов: {checked}.")
 
     def init_pool(self) -> bool:
-        """
-        Инициализация пула при старте.
-
-        Возвращает:
-            True  — нашли живую основную, работаем.
-            False — живых нет, надо ждать (wait_for_links).
-        """
-        # ШАГ 1: ищем живую основную
+        """Инициализация пула при старте."""
         primary = self._find_working_primary()
 
         if not primary:
@@ -740,21 +776,18 @@ class VlessObserver:
             self.primary = primary
 
         parsed_primary = parse_vless_link(primary)
-        primary_host = parsed_primary['host']
+        primary_display = format_host_with_geo(primary)
 
-        # ШАГ 2: ставим основную в 3x-ui
-        logger.info(f"📝 Устанавливаем основную в outbound: {primary_host}")
+        logger.info(f"📝 Устанавливаем основную в outbound: {primary_display}")
 
         if not update_3xui_outbound(self.primary, OUTBOUND_NAME):
-            logger.error("❌ Не удалось обновить outbound. Продолжаем без перезапуска x-ui.")
+            logger.error("❌ Не удалось обновить outbound.")
 
         if not reload_xray():
             logger.error("❌ Не удалось перезапустить x-ui.")
 
-        # ШАГ 3: набираем резерв
         self._fill_backup_pool()
 
-        # ШАГ 4: логируем итог
         with self.pool_lock:
             total_backup = len(self.backup_pool)
             alive_count = len([item for item in self.backup_pool if item.get('alive', False)])
@@ -763,13 +796,13 @@ class VlessObserver:
         with self.dead_links_lock:
             dead_count = len(self.dead_links)
 
-        logger.info(f"✅ Основная: {primary_host}")
+        logger.info(f"✅ Основная: {primary_display}")
         logger.info(f"✅ Резерв: {alive_count}/{total_backup}")
         logger.info(f"⏸️ В deferred: {deferred_count}")
         logger.info(f"🗑️ Помечено мёртвыми: {dead_count}")
 
-        self.last_primary_host = primary_host
-        self.last_state = f"OK | основная: {primary_host} | резерв: {alive_count}/{total_backup}"
+        self.last_primary_host = primary_display
+        self.last_state = f"OK | основная: {primary_display} | резерв: {alive_count}/{total_backup}"
         self.last_log_time = time.time()
         self.critical_error_logged = False
         self.last_pool_refill_time = time.time()
@@ -786,8 +819,10 @@ class VlessObserver:
 
         with self.primary_lock:
             primary = self.primary
-        parsed = parse_vless_link(primary) if primary else None
-        primary_host = parsed['host'] if parsed else 'NONE'
+        if primary:
+            primary_display = format_host_with_geo(primary)
+        else:
+            primary_display = 'NONE [N/A]'
 
         with self.pool_lock:
             alive_count = len([item for item in self.backup_pool if item.get('alive', False)])
@@ -799,13 +834,13 @@ class VlessObserver:
         with self.stats_lock:
             switch_count = self.switch_count
 
-        state = f"OK | {primary_host} | резерв: {alive_count}/{total_backup} живых | отложено: {deferred_count} | перекл: {switch_count}"
+        state = f"OK | {primary_display} | резерв: {alive_count}/{total_backup} живых | отложено: {deferred_count} | перекл: {switch_count}"
 
         if force or state != self.last_state or (current_time - self.last_log_time) >= 60:
             logger.info(state)
             self.last_state = state
             self.last_log_time = current_time
-            self.last_primary_host = primary_host
+            self.last_primary_host = primary_display
 
     # --------------------------------------------------------
     # ПОТОК 1: проверка основной ссылки
@@ -925,12 +960,14 @@ class VlessObserver:
                 timeout=BACKUP_TEST_TIMEOUT
             )
 
+            display = f"{item['host']} [{item.get('country', 'N/A')}]"
+
             if is_working:
                 ping_updates[item['link']] = (True, ping)
             else:
                 ping_updates[item['link']] = (False, 0)
                 dead_links.append(item['link'])
-                logger.warning(f"⚠️ Резервная ссылка {item['host']} мертва! Откладываем на 10 минут")
+                logger.warning(f"⚠️ Резервная ссылка {display} мертва! Откладываем на 10 минут")
 
         with self.pool_lock:
             for item in self.backup_pool:
@@ -1031,9 +1068,8 @@ class VlessObserver:
             for link in to_delete:
                 with self.dead_links_lock:
                     self.dead_links.add(link)
-                parsed = parse_vless_link(link)
-                host = parsed['host'] if parsed else 'unknown'
-                logger.warning(f"🗑️ Ссылка {host} не ожила за 2 часа — удалена из пула")
+                display = format_host_with_geo(link)
+                logger.warning(f"🗑️ Ссылка {display} не ожила за 2 часа — удалена из пула")
 
         if to_check:
             logger.info(f"🔄 Проверяем {len(to_check)} отложенных ссылок...")
@@ -1049,7 +1085,8 @@ class VlessObserver:
                 )
 
                 parsed = parse_vless_link(link)
-                host = parsed['host'] if parsed else 'unknown'
+                display = format_host_with_geo(link)
+                country = extract_geo_from_link(link)
 
                 with self.deferred_lock:
                     info = self.deferred_links.get(link)
@@ -1065,26 +1102,27 @@ class VlessObserver:
                     with self.dead_links_lock:
                         self.dead_links.discard(link)
 
-                    logger.info(f"✅ Отложенная ссылка {host} ожила! Пинг: {ping:.0f}мс (была в отложенных {total_elapsed_min} мин)")
+                    logger.info(f"✅ Отложенная ссылка {display} ожила! Пинг: {ping:.0f}мс (была в отложенных {total_elapsed_min} мин)")
 
                     with self.pool_lock:
                         existing_links = [item['link'] for item in self.backup_pool]
                         if link not in existing_links and len(self.backup_pool) < BACKUP_POOL_SIZE:
                             self.backup_pool.append({
                                 'link': link,
-                                'host': host,
+                                'host': parsed['host'] if parsed else 'unknown',
+                                'country': country,
                                 'alive': True,
                                 'ping': ping
                             })
-                            logger.info(f"➕ Ссылка {host} возвращена в резерв")
+                            logger.info(f"➕ Ссылка {display} возвращена в резерв")
                         else:
-                            logger.info(f"↩️ Ссылка {host} ожила, но пул полный — возвращена в общий оборот")
+                            logger.info(f"↩️ Ссылка {display} ожила, но пул полный — возвращена в общий оборот")
                 else:
                     with self.deferred_lock:
                         if link in self.deferred_links:
                             self.deferred_links[link]['last_checked_at'] = time.time()
 
-                    logger.warning(f"❌ Отложенная ссылка {host} всё ещё мертва ({total_elapsed_min} мин в deferred)")
+                    logger.warning(f"❌ Отложенная ссылка {display} всё ещё мертва ({total_elapsed_min} мин в deferred)")
 
     def update_pool_from_file(self):
         current_time = time.time()
@@ -1102,6 +1140,8 @@ class VlessObserver:
             with self.primary_lock:
                 current_primary = self.primary
 
+            current_primary_base = current_primary.split('#', 1)[0] if current_primary else None
+
             with self.pool_lock:
                 current_links = set()
                 if current_primary:
@@ -1115,13 +1155,18 @@ class VlessObserver:
                 with self.dead_links_lock:
                     dead_set = set(self.dead_links)
 
-                new_links = [
-                    l for l in all_links
-                    if l not in current_links
-                    and l not in dead_set
-                    and l not in deferred_set
-                    and l not in quarantine
-                ]
+                new_links = []
+                for l in all_links:
+                    l_base = l.split('#', 1)[0]
+                    if l in current_links:
+                        continue
+                    if l in dead_set or l in deferred_set:
+                        continue
+                    if l_base in quarantine:
+                        continue
+                    if l_base == current_primary_base:
+                        continue
+                    new_links.append(l)
 
                 if not new_links:
                     self.last_pool_update_time = current_time
@@ -1141,14 +1186,16 @@ class VlessObserver:
                         with self.dead_links_lock:
                             self.dead_links.add(link)
                         continue
+                    country = extract_geo_from_link(link)
                     self.backup_pool.append({
                         'link': link,
                         'host': parsed['host'],
+                        'country': country,
                         'alive': True,
                         'ping': 0
                     })
                     added_count += 1
-                    logger.info(f"➕ Добавлена новая резервная: {parsed['host']}")
+                    logger.info(f"➕ Добавлена новая резервная: {parsed['host']} [{country}]")
 
             if added_count > 0:
                 logger.info(f"✅ Добавлено {added_count} новых ссылок")
@@ -1171,6 +1218,8 @@ class VlessObserver:
             with self.primary_lock:
                 current = self.primary
 
+            current_base = current.split('#', 1)[0] if current else None
+
             with self.pool_lock:
                 existing_links = [item['link'] for item in self.backup_pool]
                 with self.deferred_lock:
@@ -1178,14 +1227,16 @@ class VlessObserver:
                 with self.dead_links_lock:
                     dead_set = set(self.dead_links)
 
-                available = [
-                    l for l in all_links
-                    if l != current
-                    and l not in existing_links
-                    and l not in deferred_set
-                    and l not in dead_set
-                    and l not in quarantine
-                ]
+                available = []
+                for l in all_links:
+                    l_base = l.split('#', 1)[0]
+                    if l_base == current_base:
+                        continue
+                    if l in existing_links or l in deferred_set or l in dead_set:
+                        continue
+                    if l_base in quarantine:
+                        continue
+                    available.append(l)
 
                 if not available:
                     return
@@ -1199,13 +1250,15 @@ class VlessObserver:
                         with self.dead_links_lock:
                             self.dead_links.add(link)
                         continue
+                    country = extract_geo_from_link(link)
                     self.backup_pool.append({
                         'link': link,
                         'host': parsed['host'],
+                        'country': country,
                         'alive': True,
                         'ping': 0
                     })
-                    logger.info(f"➕ Добавлена новая резервная: {parsed['host']}")
+                    logger.info(f"➕ Добавлена новая резервная: {parsed['host']} [{country}]")
 
             self.last_pool_refill_time = time.time()
 
@@ -1258,9 +1311,8 @@ class VlessObserver:
             logger.warning("Нет основной ссылки для глубокой проверки")
             return
 
-        parsed = parse_vless_link(primary)
-        primary_host = parsed['host'] if parsed else 'unknown'
-        logger.info(f"🔍 ГЛУБОКАЯ ПРОВЕРКА: {primary_host}")
+        primary_display = format_host_with_geo(primary)
+        logger.info(f"🔍 ГЛУБОКАЯ ПРОВЕРКА: {primary_display}")
 
         logger.info(f"  Шаг 1: Google...")
         google_ok, google_ping, _ = test_link_through_xray(
@@ -1302,10 +1354,9 @@ class VlessObserver:
             logger.warning("Нет основной ссылки")
             return
 
-        parsed = parse_vless_link(old_primary)
-        old_host = parsed['host'] if parsed else 'unknown'
+        old_display = format_host_with_geo(old_primary)
 
-        logger.warning(f"🛑 КАРАНТИН: {old_host}")
+        logger.warning(f"🛑 КАРАНТИН: {old_display}")
 
         try:
             os.makedirs(os.path.dirname(self.quarantine_file), exist_ok=True)
@@ -1364,10 +1415,9 @@ class VlessObserver:
                     if not self.critical_error_logged:
                         with self.primary_lock:
                             primary = self.primary
-                        parsed = parse_vless_link(primary) if primary else None
-                        last_host = parsed['host'] if parsed else 'NONE'
+                        last_display = format_host_with_geo(primary) if primary else 'NONE [N/A]'
                         logger.critical("🔴 КРИТИЧЕСКАЯ ОШИБКА: НЕТ РАБОЧИХ ССЫЛОК В РЕЗЕРВЕ!")
-                        logger.critical(f"Последняя рабочая: {last_host}")
+                        logger.critical(f"Последняя рабочая: {last_display}")
                         self.critical_error_logged = True
                     return
 
@@ -1377,12 +1427,10 @@ class VlessObserver:
             with self.primary_lock:
                 old_primary = self.primary
 
-            parsed_old = parse_vless_link(old_primary) if old_primary else None
-            parsed_new = parse_vless_link(new_primary)
-            old_host = parsed_old['host'] if parsed_old else 'NONE'
-            new_host = parsed_new['host'] if parsed_new else 'unknown'
+            old_display = format_host_with_geo(old_primary) if old_primary else 'NONE [N/A]'
+            new_display = format_host_with_geo(new_primary)
 
-            logger.warning(f"⚠️ ПЕРЕКЛЮЧЕНИЕ: {old_host} → {new_host}")
+            logger.warning(f"⚠️ ПЕРЕКЛЮЧЕНИЕ: {old_display} → {new_display}")
 
             if update_3xui_outbound(new_primary, OUTBOUND_NAME):
                 if reload_xray():
@@ -1420,7 +1468,6 @@ class VlessObserver:
         logger.info("🚀 VLESS OBSERVER (multi-threaded)")
         logger.info("="*50)
 
-        # Ищем файл и живую основную в цикле
         while True:
             if _shutdown_requested.is_set():
                 return
@@ -1433,17 +1480,14 @@ class VlessObserver:
                     time.sleep(60)
                 continue
 
-            # Файл есть — пробуем инициализировать пул
             if self.init_pool():
                 break
             else:
-                # Нет живых ссылок — ждём обновления от чекера
                 logger.info("⏳ Ждём обновления файла от чекера (проверка каждые 60 сек)...")
                 for _ in range(60):
                     if _shutdown_requested.is_set():
                         return
                     time.sleep(1)
-                # перезагружаем файл и пробуем снова
                 continue
 
         logger.info(f"Порты: primary={PROXY_PORT_PRIMARY}, backup={PROXY_PORT_BACKUP}, deferred={PROXY_PORT_DEFERRED}")
@@ -1478,14 +1522,13 @@ class VlessObserver:
 
         with self.primary_lock:
             primary = self.primary
-        parsed = parse_vless_link(primary) if primary else None
-        primary_host = parsed['host'] if parsed else 'NONE'
+        final_display = format_host_with_geo(primary) if primary else 'NONE [N/A]'
 
         with self.stats_lock:
             switch_count = self.switch_count
 
         logger.info("="*50)
-        logger.info(f"📊 ИТОГИ: переключений: {switch_count} | основная: {primary_host}")
+        logger.info(f"📊 ИТОГИ: переключений: {switch_count} | основная: {final_display}")
         logger.info("="*50)
 
 
