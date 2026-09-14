@@ -7,7 +7,7 @@
 # Использование:
 #   bash update.sh              — проверить и обновить (с подтверждением)
 #   bash update.sh --check      — только проверить, есть ли обновление
-#   bash update.sh --auto       — обновить без вопросов
+#   bash update.sh --auto       — обновить без вопросов (merge конфигов пропускается)
 #   bash update.sh --rollback   — откатиться из последнего бэкапа
 #   bash update.sh --help       — справка
 #
@@ -32,10 +32,15 @@ BACKUP_DIR_BASE="/root"
 BACKUP_KEEP=5
 
 UPDATE_SCRIPT_PATH="/root/update.sh"
+MERGE_SCRIPT_PATH="/root/merge_config.py"
 
-# Список файлов, которые обновляются (без данных!)
-CHECKER_FILES="vless_check_config.py vless_checker.py server_tester.py run_stage1.sh run_stage2.sh run_full_check.sh"
-OBSERVER_FILES="observer_config.py observer.py show_logs.sh run_observer.sh"
+# Файлы, которые обновляются как обычно (замена)
+CHECKER_FILES="vless_checker.py server_tester.py run_stage1.sh run_stage2.sh run_full_check.sh"
+OBSERVER_FILES="observer.py show_logs.sh run_observer.sh"
+
+# Файлы-конфиги, которые обновляются через merge_config.py
+CHECKER_CONFIG_FILES="vless_check_config.py"
+OBSERVER_CONFIG_FILES="observer_config.py"
 
 # ============================================================
 # ЦВЕТА
@@ -93,7 +98,7 @@ VLESS CASCADE UPDATER
 Использование:
   bash update.sh              Проверить и обновить (с подтверждением)
   bash update.sh --check      Только проверить наличие обновления
-  bash update.sh --auto       Обновить без вопросов
+  bash update.sh --auto       Обновить без вопросов (merge конфигов пропускается)
   bash update.sh --rollback   Откатиться из последнего бэкапа
   bash update.sh --help       Показать эту справку
 
@@ -182,7 +187,6 @@ check_shebang() {
 do_rollback() {
     print_header "ОТКАТ ИЗ БЭКАПА"
 
-    # Ищем последний бэкап
     local latest_backup
     latest_backup=$(ls -dt ${BACKUP_DIR_BASE}/vless_backup_* 2>/dev/null | head -n 1)
 
@@ -193,7 +197,6 @@ do_rollback() {
 
     print_info "Последний бэкап: $latest_backup"
 
-    # Читаем версию из бэкапа
     local backup_version="unknown"
     if [ -f "$latest_backup/.vless_cascade_version" ]; then
         backup_version=$(cat "$latest_backup/.vless_cascade_version")
@@ -207,13 +210,11 @@ do_rollback() {
         exit 0
     fi
 
-    # Останавливаем observer
     print_info "Останавливаем observer..."
     animate_start "systemctl stop vless_observer"
     systemctl stop vless_observer 2>/dev/null || true
     animate_stop
 
-    # Восстанавливаем файлы
     print_info "Восстанавливаем файлы..."
     if [ -d "$latest_backup/vless_checker" ]; then
         rm -rf "$CHECKER_DIR"
@@ -238,7 +239,6 @@ do_rollback() {
         print_success "Восстановлена версия: $(cat $VERSION_FILE_LOCAL)"
     fi
 
-    # Запускаем observer
     print_info "Запускаем observer..."
     animate_start "systemctl start vless_observer"
     systemctl start vless_observer
@@ -331,7 +331,6 @@ print_header "ЧТО НОВОГО"
 
 tmp_changelog=$(mktemp)
 if download_file "$CHANGELOG_REMOTE" "$tmp_changelog" "CHANGELOG.md"; then
-    # Показываем секцию для новой версии
     awk -v ver="$remote_version" '
         $0 ~ "\\[?"ver"\\]?" { found=1 }
         found && /^## \[/ && !/'"$remote_version"'/ && seen { exit }
@@ -411,6 +410,20 @@ else
 fi
 
 # ============================================================
+# СКАЧИВАНИЕ MERGE_CONFIG.PY
+# ============================================================
+print_info "Скачиваем merge_config.py..."
+if download_file "$GITHUB_RAW/merge_config.py" "$MERGE_SCRIPT_PATH" "merge_config.py"; then
+    chmod +x "$MERGE_SCRIPT_PATH"
+    print_success "merge_config.py готов"
+    HAVE_MERGE=1
+else
+    print_warning "Не удалось скачать merge_config.py"
+    print_warning "Конфиги будут обновлены стандартным способом (перезапись)"
+    HAVE_MERGE=0
+fi
+
+# ============================================================
 # СКАЧИВАНИЕ ФАЙЛОВ
 # ============================================================
 print_header "ОБНОВЛЕНИЕ ФАЙЛОВ"
@@ -436,8 +449,8 @@ download_and_check() {
     return 0
 }
 
-# Чекер
-print_info "Обновляем Чекер..."
+# Обычные файлы чекера
+print_info "Обновляем Чекер (код)..."
 for file in $CHECKER_FILES; do
     if download_and_check "$GITHUB_RAW/$file" "$CHECKER_DIR/$file" "$file"; then
         print_success "  ✓ $file"
@@ -446,8 +459,8 @@ for file in $CHECKER_FILES; do
     fi
 done
 
-# Observer
-print_info "Обновляем Observer..."
+# Обычные файлы observer'а
+print_info "Обновляем Observer (код)..."
 for file in $OBSERVER_FILES; do
     if download_and_check "$GITHUB_RAW/$file" "$OBSERVER_DIR/$file" "$file"; then
         print_success "  ✓ $file"
@@ -462,6 +475,74 @@ if download_and_check "$GITHUB_RAW/update.sh" "$UPDATE_SCRIPT_PATH" "update.sh";
     print_success "  ✓ update.sh"
 else
     print_warning "  ✗ update.sh (пропущен)"
+fi
+
+# ============================================================
+# СЛИЯНИЕ КОНФИГОВ
+# ============================================================
+print_header "КОНФИГИ (умное слияние)"
+
+# Функция слияния одного конфига
+merge_one_config() {
+    local dir="$1"
+    local file="$2"
+    local current_path="$dir/$file"
+    local tmp_new="/tmp/${file}.new"
+
+    if [ ! -f "$current_path" ]; then
+        print_warning "Конфиг не найден: $current_path — скачиваем как новый"
+        if download_and_check "$GITHUB_RAW/$file" "$current_path" "$file"; then
+            print_success "  ✓ $file (установлен впервые)"
+        fi
+        return
+    fi
+
+    # Скачиваем новый конфиг во временный файл
+    if ! download_file "$GITHUB_RAW/$file" "$tmp_new" "$file"; then
+        print_warning "  ✗ $file: не удалось скачать новую версию — пропущен"
+        rm -f "$tmp_new"
+        return
+    fi
+
+    if ! check_shebang "$tmp_new"; then
+        print_warning "  ✗ $file: неверный shebang — пропущен"
+        rm -f "$tmp_new"
+        return
+    fi
+
+    # Запускаем merge_config.py
+    local merge_args=("$current_path" "$tmp_new" "$file")
+    if [ "$MODE" = "auto" ]; then
+        merge_args+=("--auto")
+    fi
+
+    set +e
+    python3 "$MERGE_SCRIPT_PATH" "${merge_args[@]}"
+    local merge_exit=$?
+    set -e
+
+    rm -f "$tmp_new"
+
+    case $merge_exit in
+        0) print_success "  ✓ $file: слияние завершено" ;;
+        2) print_warning "  ⊘ $file: слияние отменено пользователем" ;;
+        *) print_warning "  ✗ $file: ошибка слияния (код $merge_exit)" ;;
+    esac
+}
+
+if [ "$HAVE_MERGE" = "1" ]; then
+    print_info "Чекер: vless_check_config.py"
+    for file in $CHECKER_CONFIG_FILES; do
+        merge_one_config "$CHECKER_DIR" "$file"
+    done
+
+    print_info "Observer: observer_config.py"
+    for file in $OBSERVER_CONFIG_FILES; do
+        merge_one_config "$OBSERVER_DIR" "$file"
+    done
+else
+    print_warning "merge_config.py недоступен — конфиги НЕ обновляем."
+    print_warning "Скачайте merge_config.py вручную или обновите конфиги самостоятельно."
 fi
 
 # ============================================================
