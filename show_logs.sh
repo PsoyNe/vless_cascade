@@ -22,6 +22,11 @@ TRIGGER_SWITCH="/tmp/vless_observer_trigger"
 TRIGGER_QUARANTINE="/tmp/vless_quarantine_trigger"
 TRIGGER_DEEP_CHECK="/tmp/vless_deep_check_trigger"
 
+# Файлы обновления
+VERSION_FILE_LOCAL="/root/.vless_cascade_version"
+UPDATE_SCRIPT="/root/update.sh"
+GITHUB_VERSION_URL="https://raw.githubusercontent.com/PsoyNe/vless_cascade/refs/heads/main/VERSION"
+
 print_header() {
     echo ""
     echo -e "${BLUE}============================================================${NC}"
@@ -57,9 +62,14 @@ show_menu() {
     echo " 11) Триггер: карантин (основная ссылка → в файл карантина)"
     echo " 12) Триггер: глубокая проверка (Google + запрещённые)"
     echo ""
+    echo -e "${GREEN}--- ОБНОВЛЕНИЕ ---${NC}"
+    echo " 16) Проверить наличие обновлений"
+    echo " 17) Обновить (с подтверждением)"
+    echo " 18) Откатиться из последнего бэкапа"
+    echo ""
     echo "  0) Выход"
     echo ""
-    read -p "Введите номер (0-15): " choice
+    read -p "Введите номер (0-18): " choice
 }
 
 show_observer() {
@@ -338,6 +348,119 @@ show_processes() {
 }
 
 # ============================================================
+# ОБНОВЛЕНИЕ
+# ============================================================
+
+check_update() {
+    print_header "ПРОВЕРКА ОБНОВЛЕНИЙ"
+
+    # Локальная версия
+    local local_version="0.0.0"
+    if [ -f "$VERSION_FILE_LOCAL" ]; then
+        local_version=$(cat "$VERSION_FILE_LOCAL" | tr -d '[:space:]')
+    else
+        echo -e "${YELLOW}⚠️ Файл версии не найден: $VERSION_FILE_LOCAL${NC}"
+        echo -e "${YELLOW}   Считаем, что установлена версия 0.0.0${NC}"
+    fi
+
+    echo -e "${CYAN}📊 Версии:${NC}"
+    echo "  Установленная: $local_version"
+
+    # Удалённая версия
+    local remote_version
+    remote_version=$(wget -q --timeout=10 -O - "$GITHUB_VERSION_URL" 2>/dev/null | tr -d '[:space:]')
+
+    if [ -z "$remote_version" ]; then
+        echo -e "${RED}  Не удалось получить версию с GitHub${NC}"
+        echo ""
+        echo "Проверьте интернет и повторите."
+        return 1
+    fi
+
+    echo "  На GitHub:     $remote_version"
+    echo ""
+
+    if [ "$local_version" = "$remote_version" ]; then
+        echo -e "${GREEN}✅ У вас последняя версия ($local_version).${NC}"
+        return 0
+    else
+        echo -e "${YELLOW}⚠️ Доступно обновление: $local_version → $remote_version${NC}"
+        echo ""
+        echo -e "${CYAN}Для обновления используйте пункт 17 меню${NC}"
+        return 2
+    fi
+}
+
+do_update() {
+    print_header "ОБНОВЛЕНИЕ"
+
+    if [ ! -f "$UPDATE_SCRIPT" ]; then
+        echo -e "${RED}❌ Скрипт обновления не найден: $UPDATE_SCRIPT${NC}"
+        echo ""
+        echo "Скачайте его вручную:"
+        echo "  wget -qO /root/update.sh https://raw.githubusercontent.com/PsoyNe/vless_cascade/refs/heads/main/update.sh"
+        echo "  chmod +x /root/update.sh"
+        return 1
+    fi
+
+    if [ ! -x "$UPDATE_SCRIPT" ]; then
+        echo -e "${YELLOW}⚠️ Скрипт обновления не исполняемый. Исправляем...${NC}"
+        chmod +x "$UPDATE_SCRIPT"
+    fi
+
+    echo -e "${CYAN}Запуск скрипта обновления...${NC}"
+    echo ""
+    echo "────────────────────────────────────────────────────────────"
+    echo ""
+
+    bash "$UPDATE_SCRIPT"
+
+    echo ""
+    echo "────────────────────────────────────────────────────────────"
+    echo -e "${GREEN}✅ Скрипт обновления завершён${NC}"
+}
+
+do_rollback() {
+    print_header "ОТКАТ ИЗ БЭКАПА"
+
+    if [ ! -f "$UPDATE_SCRIPT" ]; then
+        echo -e "${RED}❌ Скрипт обновления не найден: $UPDATE_SCRIPT${NC}"
+        return 1
+    fi
+
+    # Показать список бэкапов
+    echo -e "${CYAN}📁 Доступные бэкапы:${NC}"
+    if ls -dt /root/vless_backup_* 2>/dev/null | head -5 | while read -r b; do
+        echo "  $(basename "$b")"
+    done; then
+        :
+    else
+        echo -e "${YELLOW}  Бэкапы не найдены${NC}"
+        return 1
+    fi
+
+    echo ""
+    echo -e "${YELLOW}⚠️ Откат восстановит файлы из последнего бэкапа.${NC}"
+    echo ""
+    read -p "Продолжить? (y/n): " confirm
+
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Отменено${NC}"
+        return 0
+    fi
+
+    echo ""
+    echo "────────────────────────────────────────────────────────────"
+    echo ""
+
+    bash "$UPDATE_SCRIPT" --rollback
+
+    echo ""
+    echo "────────────────────────────────────────────────────────────"
+    echo -e "${GREEN}✅ Откат завершён${NC}"
+}
+
+# ============================================================
 # ГЛАВНЫЙ ЦИКЛ
 # ============================================================
 while true; do
@@ -359,6 +482,9 @@ while true; do
         13) show_rotated ;;
         14) show_services ;;
         15) show_processes ;;
+        16) check_update ;;
+        17) do_update ;;
+        18) do_rollback ;;
         0) echo -e "${GREEN}Выход${NC}"; exit 0 ;;
         *) echo -e "${RED}Неверный выбор${NC}" ;;
     esac
