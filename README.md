@@ -3,7 +3,7 @@
 **Каскадный VPN без аренды серверов.** Комбайн по сбору рабочих VLESS-ссылок и их автоматическому обновлению в панели 3x-ui.
 
 [![Telegram](https://img.shields.io/badge/Telegram-@PsoyNe-blue?logo=telegram)](https://t.me/PsoyNe)
-![Version](https://img.shields.io/badge/version-1.0.0-green)
+![Version](https://img.shields.io/badge/version-1.0.1-green)
 
 ---
 
