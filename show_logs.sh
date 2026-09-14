@@ -15,8 +15,7 @@ NC='\033[0m'
 # Файлы логов
 LOG_OBSERVER="/var/log/vless_observer.log"
 LOG_CHECKER="/var/log/vless_checker.log"
-LOG_SERVER="/var/log/server_test.log"
-LOG_FULL="/var/log/vless_full.log"
+LOG_CRON="/var/log/vless_checker_cron.log"
 
 # Триггер-файлы
 TRIGGER_SWITCH="/tmp/vless_observer_trigger"
@@ -38,13 +37,17 @@ show_menu() {
     echo -e "${YELLOW}--- ЛОГИ ---${NC}"
     echo "  1) Показать логи Observer (последние 50 строк)"
     echo "  2) Показать логи Observer (в реальном времени)"
-    echo "  3) Показать логи Чекера (этап 1)"
-    echo "  4) Показать логи Тестера (этап 2)"
-    echo "  5) Показать полный цикл чекера"
+    echo "  3) Показать логи Чекера (этап 1, последние 50 строк)"
+    echo "  4) Показать логи Чекера (в реальном времени)"
+    echo "  5) Показать логи cron-обёртки чекера"
     echo "  6) Показать все логи (сводка)"
     echo "  7) Показать ошибки во всех логах"
     echo "  8) Показать статистику Observer"
     echo "  9) Очистить все логи"
+    echo ""
+    echo -e "${YELLOW}--- СТАТУС ---${NC}"
+    echo " 14) Статус служб (observer, x-ui, cron)"
+    echo " 15) Кто сейчас работает (observer, checker, xray)"
     echo ""
     echo -e "${YELLOW}--- РОТАЦИЯ ЛОГОВ ---${NC}"
     echo " 13) Показать ротированные архивы логов"
@@ -56,7 +59,7 @@ show_menu() {
     echo ""
     echo "  0) Выход"
     echo ""
-    read -p "Введите номер (0-13): " choice
+    read -p "Введите номер (0-15): " choice
 }
 
 show_observer() {
@@ -86,21 +89,25 @@ show_checker() {
     fi
 }
 
-show_server() {
-    print_header "ЛОГИ ТЕСТЕРА (этап 2, последние 50 строк)"
-    if [ -f "$LOG_SERVER" ]; then
-        tail -50 "$LOG_SERVER"
+show_checker_live() {
+    print_header "ЛОГИ ЧЕКЕРА (в реальном времени, Ctrl+C для выхода)"
+    if [ -f "$LOG_CHECKER" ]; then
+        tail -f "$LOG_CHECKER"
     else
-        echo -e "${RED}Файл $LOG_SERVER не найден${NC}"
+        echo -e "${RED}Файл $LOG_CHECKER не найден${NC}"
     fi
 }
 
-show_full() {
-    print_header "ЛОГИ ПОЛНОГО ЦИКЛА (последние 50 строк)"
-    if [ -f "$LOG_FULL" ]; then
-        tail -50 "$LOG_FULL"
+show_cron() {
+    print_header "ЛОГИ CRON-ОБЁРТКИ ЧЕКЕРА (последние 50 строк)"
+    if [ -f "$LOG_CRON" ]; then
+        tail -50 "$LOG_CRON"
     else
-        echo -e "${RED}Файл $LOG_FULL не найден${NC}"
+        echo -e "${YELLOW}Файл $LOG_CRON не найден или пуст${NC}"
+        echo ""
+        echo "Это нормально, если чекер пишет только через Python logging"
+        echo "в /var/log/vless_checker.log. Cron-лог — это stdout/stderr"
+        echo "обёртки, туда попадает только то, что чекер печатает в консоль."
     fi
 }
 
@@ -123,17 +130,9 @@ show_all() {
     fi
 
     echo ""
-    echo -e "${CYAN}📊 ТЕСТЕР (этап 2):${NC}"
-    if [ -f "$LOG_SERVER" ]; then
-        tail -5 "$LOG_SERVER"
-    else
-        echo "  Файл не найден"
-    fi
-
-    echo ""
-    echo -e "${CYAN}📊 ПОЛНЫЙ ЦИКЛ:${NC}"
-    if [ -f "$LOG_FULL" ]; then
-        tail -5 "$LOG_FULL"
+    echo -e "${CYAN}📊 CRON-ОБЁРТКА:${NC}"
+    if [ -f "$LOG_CRON" ]; then
+        tail -5 "$LOG_CRON"
     else
         echo "  Файл не найден"
     fi
@@ -154,9 +153,9 @@ show_errors() {
     fi
 
     echo ""
-    echo -e "${CYAN}📊 ТЕСТЕР:${NC}"
-    if [ -f "$LOG_SERVER" ]; then
-        grep -i "error\|ошибка\|❌" "$LOG_SERVER" | tail -5 || echo "  Ошибок нет"
+    echo -e "${CYAN}📊 CRON-ОБЁРТКА:${NC}"
+    if [ -f "$LOG_CRON" ]; then
+        grep -i "error\|ошибка\|❌" "$LOG_CRON" | tail -5 || echo "  Ошибок нет"
     fi
 }
 
@@ -170,11 +169,11 @@ show_stats() {
 
     echo -e "${CYAN}📊 Общая статистика:${NC}"
     echo "  Переключений: $(grep -c "ПЕРЕКЛЮЧЕНИЕ" "$LOG_OBSERVER")"
-    echo "  Возвратов: $(grep -c "ВОЗВРАТ" "$LOG_OBSERVER")"
     echo "  Мёртвых ссылок: $(grep -c "мертва" "$LOG_OBSERVER")"
     echo "  Удалено из пула: $(grep -c "🗑️" "$LOG_OBSERVER")"
     echo "  Карантинов: $(grep -c "КАРАНТИН" "$LOG_OBSERVER")"
     echo "  Глубоких проверок: $(grep -c "ГЛУБОКАЯ ПРОВЕРКА" "$LOG_OBSERVER")"
+    echo "  Ожило из отложенных: $(grep -c "ожила" "$LOG_OBSERVER")"
 
     echo ""
     echo -e "${CYAN}📊 Текущий статус:${NC}"
@@ -182,7 +181,7 @@ show_stats() {
 
     echo ""
     echo -e "${CYAN}📊 Последнее переключение:${NC}"
-    grep "ПЕРЕКЛЮЧЕНИЕ" "$LOG_OBSERVER" | tail -1
+    grep "ПЕРЕКЛЮЧЕНИЕ" "$LOG_OBSERVER" | tail -1 || echo "  Переключений не было"
 }
 
 clear_logs() {
@@ -192,8 +191,7 @@ clear_logs() {
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         > "$LOG_OBSERVER" 2>/dev/null
         > "$LOG_CHECKER" 2>/dev/null
-        > "$LOG_SERVER" 2>/dev/null
-        > "$LOG_FULL" 2>/dev/null
+        > "$LOG_CRON" 2>/dev/null
         echo -e "${GREEN}✅ Все логи очищены${NC}"
     else
         echo -e "${YELLOW}Отменено${NC}"
@@ -246,7 +244,7 @@ trigger_quarantine() {
         echo -e "${CYAN}Что произойдёт:${NC}"
         echo "  1. Observer обнаружит триггер (в течение 5 сек)"
         echo "  2. Текущая основная ссылка → в файл карантина"
-        echo "  3. Первый этап больше НИКОГДА её не проверит"
+        echo "  3. Чекер больше НИКОГДА её не проверит"
         echo "  4. Observer переключится на резервную"
     else
         echo -e "${RED}❌ Не удалось создать триггер${NC}"
@@ -286,11 +284,57 @@ trigger_deep_check() {
 show_rotated() {
     print_header "РОТИРОВАННЫЕ АРХИВЫ ЛОГОВ"
 
-    for base in "$LOG_OBSERVER" "$LOG_CHECKER" "$LOG_SERVER" "$LOG_FULL"; do
+    for base in "$LOG_OBSERVER" "$LOG_CHECKER" "$LOG_CRON"; do
         echo -e "${CYAN}📁 ${base}*${NC}"
         ls -lh "${base}"* 2>/dev/null | tail -n +2 || echo "  Архивов нет"
         echo ""
     done
+}
+
+show_services() {
+    print_header "СТАТУС СЛУЖБ"
+
+    echo -e "${CYAN}🔄 VLESS Observer:${NC}"
+    systemctl status vless_observer --no-pager 2>/dev/null | head -12 || echo "  Служба не найдена"
+    echo ""
+
+    echo -e "${CYAN}🔄 x-ui:${NC}"
+    systemctl status x-ui --no-pager 2>/dev/null | head -8 || echo "  Служба не найдена"
+    echo ""
+
+    echo -e "${CYAN}🔄 cron:${NC}"
+    systemctl status cron --no-pager 2>/dev/null | head -8 || echo "  Служба не найдена"
+}
+
+show_processes() {
+    print_header "АКТИВНЫЕ ПРОЦЕССЫ"
+
+    echo -e "${CYAN}📊 Observer:${NC}"
+    pgrep -af "observer.py" || echo "  Не запущен"
+    echo ""
+
+    echo -e "${CYAN}📊 Checker:${NC}"
+    pgrep -af "vless_checker.py" || echo "  Не запущен"
+    echo ""
+
+    echo -e "${CYAN}📊 Xray-процессы (всего):${NC}"
+    local count=$(pgrep -fc "xray-linux-arm32" 2>/dev/null || echo 0)
+    echo "  Всего: $count"
+    echo ""
+    ps -eo pid,ppid,etime,pcpu,cmd 2>/dev/null | grep "xray-linux-arm32" | grep -v grep | awk '{printf "  PID %-7s PPID %-7s uptime %-10s CPU %-6s %s\n", $1, $2, $3, $4, $5}' | head -20
+
+    echo ""
+    echo -e "${CYAN}📊 Lock-файл чекера:${NC}"
+    if [ -f /var/run/vless_checker.lock ]; then
+        ls -lh /var/run/vless_checker.lock
+        if flock -n /var/run/vless_checker.lock echo "  Статус: свободен" 2>/dev/null; then
+            :
+        else
+            echo "  Статус: ЗАНЯТ (чекер работает)"
+        fi
+    else
+        echo "  Файл не создан (чекер ещё не запускался)"
+    fi
 }
 
 # ============================================================
@@ -303,8 +347,8 @@ while true; do
         1) show_observer ;;
         2) show_observer_live ;;
         3) show_checker ;;
-        4) show_server ;;
-        5) show_full ;;
+        4) show_checker_live ;;
+        5) show_cron ;;
         6) show_all ;;
         7) show_errors ;;
         8) show_stats ;;
@@ -313,6 +357,8 @@ while true; do
         11) trigger_quarantine ;;
         12) trigger_deep_check ;;
         13) show_rotated ;;
+        14) show_services ;;
+        15) show_processes ;;
         0) echo -e "${GREEN}Выход${NC}"; exit 0 ;;
         *) echo -e "${RED}Неверный выбор${NC}" ;;
     esac
