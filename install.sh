@@ -7,6 +7,16 @@
 set -e
 
 # ============================================================
+# НАСТРОЙКИ
+# ============================================================
+GITHUB_RAW="https://raw.githubusercontent.com/PsoyNe/vless_cascade/refs/heads/main"
+
+CHECKER_DIR="/root/vless_checker"
+OBSERVER_DIR="/root/vless_observer"
+VERSION_FILE_LOCAL="/root/.vless_cascade_version"
+UPDATE_SCRIPT_PATH="/root/update.sh"
+
+# ============================================================
 # ЦВЕТА ДЛЯ ВЫВОДА
 # ============================================================
 RED='\033[0;31m'
@@ -25,12 +35,6 @@ print_header()  { echo ""; echo "===============================================
 # ============================================================
 # ПРОГРЕСС-БАР
 # ============================================================
-# Использование:
-#   progress_bar_init "Скачивание" 12
-#   progress_bar_step "vless_checker.py"
-#   ...
-#   progress_bar_finish
-
 PROGRESS_TOTAL=0
 PROGRESS_CURRENT=0
 PROGRESS_LABEL=""
@@ -57,7 +61,6 @@ progress_bar_step() {
     for ((i=0; i<empty; i++)); do bar="${bar}░"; done
 
     local item="${1:-}"
-    # Обрезаем item до 40 символов, чтобы не ломать строку
     if [ ${#item} -gt 40 ]; then
         item="${item:0:37}..."
     fi
@@ -77,11 +80,9 @@ progress_bar_finish() {
         "$PROGRESS_LABEL" "$bar" "Готово"
 }
 
-# Анимированный прогресс для операций без известного количества шагов
-# Использование:
-#   animate_start "Установка пакетов"
-#   <долгая операция>
-#   animate_stop
+# ============================================================
+# АНИМАЦИЯ (спиннер) для операций без прогресса
+# ============================================================
 ANIMATE_PID=""
 
 animate_start() {
@@ -102,12 +103,11 @@ animate_stop() {
     if [ -n "$ANIMATE_PID" ]; then
         kill "$ANIMATE_PID" 2>/dev/null || true
         wait "$ANIMATE_PID" 2>/dev/null || true
-        printf "\r\033[K"   # очищаем строку
+        printf "\r\033[K"
         ANIMATE_PID=""
     fi
 }
 
-# Гарантированная очистка анимации при выходе
 trap 'animate_stop' EXIT
 
 # ============================================================
@@ -186,16 +186,14 @@ else
 fi
 
 # ============================================================
-# СКАЧИВАНИЕ ФАЙЛОВ ИЗ GITHUB
+# ФУНКЦИЯ СКАЧИВАНИЯ
 # ============================================================
-GITHUB_RAW="https://raw.githubusercontent.com/PsoyNe/vless_cascade/refs/heads/main"
-
 download_file() {
     local url="$1"
     local dest="$2"
     local name="$3"
 
-    if ! wget -q "$url" -O "$dest" 2>/dev/null; then
+    if ! wget -q --timeout=10 "$url" -O "$dest" 2>/dev/null; then
         print_error "Не удалось скачать: $name"
         return 1
     fi
@@ -208,11 +206,27 @@ download_file() {
 }
 
 # ============================================================
+# СКАЧИВАНИЕ VERSION
+# ============================================================
+print_header "ПОЛУЧЕНИЕ ВЕРСИИ"
+
+tmp_version=$(mktemp)
+if ! download_file "$GITHUB_RAW/VERSION" "$tmp_version" "VERSION"; then
+    rm -f "$tmp_version"
+    print_error "Не удалось получить VERSION с GitHub."
+    print_error "Проверьте интернет и повторите попытку."
+    exit 1
+fi
+
+INSTALL_VERSION=$(cat "$tmp_version" | tr -d '[:space:]')
+rm -f "$tmp_version"
+
+print_success "Версия для установки: $INSTALL_VERSION"
+
+# ============================================================
 # УСТАНОВКА VLESS CHECKER (Этап 1)
 # ============================================================
 print_header "УСТАНОВКА VLESS CHECKER (Этап 1)"
-
-CHECKER_DIR="/root/vless_checker"
 
 if [ -d "$CHECKER_DIR" ]; then
     print_warning "Директория $CHECKER_DIR уже существует"
@@ -229,10 +243,7 @@ fi
 if [ -z "$CHECKER_SKIP" ]; then
     mkdir -p "$CHECKER_DIR"
 
-    # Основные файлы этапа 1 + скрипты
     CHECKER_FILES="vless_check_config.py vless_checker.py server_tester.py run_stage1.sh run_stage2.sh run_full_check.sh"
-
-    # Считаем количество для прогресса
     NUM_CHECKER_FILES=$(echo "$CHECKER_FILES" | wc -w)
     progress_bar_init "Checker" "$NUM_CHECKER_FILES"
 
@@ -255,8 +266,6 @@ fi
 # УСТАНОВКА VLESS OBSERVER
 # ============================================================
 print_header "УСТАНОВКА VLESS OBSERVER"
-
-OBSERVER_DIR="/root/vless_observer"
 
 if [ -d "$OBSERVER_DIR" ]; then
     print_warning "Директория $OBSERVER_DIR уже существует"
@@ -288,12 +297,34 @@ if [ -z "$OBSERVER_SKIP" ]; then
 fi
 
 # ============================================================
+# СКАЧИВАНИЕ UPDATE.SH
+# ============================================================
+print_header "УСТАНОВКА СКРИПТА ОБНОВЛЕНИЯ"
+
+print_info "Скачиваем update.sh..."
+if download_file "$GITHUB_RAW/update.sh" "$UPDATE_SCRIPT_PATH" "update.sh"; then
+    chmod +x "$UPDATE_SCRIPT_PATH"
+    print_success "update.sh установлен: $UPDATE_SCRIPT_PATH"
+else
+    print_warning "Не удалось скачать update.sh"
+    print_warning "Автообновление будет недоступно."
+fi
+
+# ============================================================
+# СОХРАНЕНИЕ ВЕРСИИ
+# ============================================================
+print_info "Сохраняем версию: $INSTALL_VERSION"
+echo "$INSTALL_VERSION" > "$VERSION_FILE_LOCAL"
+print_success "Версия сохранена: $VERSION_FILE_LOCAL"
+
+# ============================================================
 # НАСТРОЙКА CRON ДЛЯ ЧЕКЕРА
 # ============================================================
 print_header "НАСТРОЙКА CRON ДЛЯ ЧЕКЕРА"
 
 # Этап 1 запускается 4 раза в сутки: 01:00, 07:00, 13:00, 19:00
-CRON_JOB='0 1,7,13,19 * * * /usr/bin/python3 /root/vless_checker/vless_checker.py >> /var/log/vless_checker_cron.log 2>&1'
+# flock -n защищает от двойного запуска, если предыдущий прогон ещё работает
+CRON_JOB='0 1,7,13,19 * * * /usr/bin/flock -n /var/run/vless_checker.lock /usr/bin/python3 /root/vless_checker/vless_checker.py >> /var/log/vless_checker_cron.log 2>&1'
 
 if crontab -l 2>/dev/null | grep -q "vless_checker"; then
     print_warning "Cron задание для чекера уже существует"
@@ -392,15 +423,26 @@ else
     print_warning "Проверьте путь в vless_check_config.py и observer_config.py (XRAY_PATH)"
 fi
 
+print_info "Проверка update.sh..."
+if [ -f "$UPDATE_SCRIPT_PATH" ] && [ -x "$UPDATE_SCRIPT_PATH" ]; then
+    print_success "Скрипт обновления готов"
+else
+    print_warning "Скрипт обновления недоступен"
+fi
+
 # ============================================================
 # ИТОГ
 # ============================================================
 print_header "УСТАНОВКА ЗАВЕРШЕНА"
 
-echo "📁 VLESS Checker:  /root/vless_checker/"
-echo "📁 VLESS Observer: /root/vless_observer/"
+echo "✅ Версия: $INSTALL_VERSION"
 echo ""
-echo "⏰ Cron задание (этап 1, 4 раза в сутки):"
+echo "📁 VLESS Checker:  $CHECKER_DIR"
+echo "📁 VLESS Observer: $OBSERVER_DIR"
+echo "📄 Файл версии:    $VERSION_FILE_LOCAL"
+echo "🔄 Скрипт обновления: $UPDATE_SCRIPT_PATH"
+echo ""
+echo "⏰ Cron задание (этап 1, 4 раза в сутки, с flock):"
 crontab -l | grep vless_checker || echo "  Не найдено"
 echo ""
 echo "🔄 Служба Observer:"
@@ -408,7 +450,7 @@ systemctl status vless_observer --no-pager | head -15
 echo ""
 echo "🚀 Запуск вручную:"
 echo "  Этап 1 (сбор 30 ссылок):"
-echo "    cd /root/vless_checker && nohup python3 vless_checker.py > /dev/null 2>&1 &"
+echo "    cd $CHECKER_DIR && nohup python3 vless_checker.py > /dev/null 2>&1 &"
 echo "    tail -f /var/log/vless_checker.log"
 echo ""
 echo "  Observer:"
@@ -426,7 +468,10 @@ echo "  touch /tmp/vless_quarantine_trigger  # отправить основну
 echo "  touch /tmp/vless_deep_check_trigger  # глубокая проверка"
 echo ""
 echo "📋 Просмотр логов через меню:"
-echo "  bash /root/vless_observer/show_logs.sh"
+echo "  bash $OBSERVER_DIR/show_logs.sh"
+echo ""
+echo "🔄 Проверка обновлений:"
+echo "  bash $UPDATE_SCRIPT_PATH --check"
 echo ""
 
 print_warning "ВАЖНО: Первый запуск этапа 1 соберёт 30 ссылок в working_links.txt."
