@@ -24,6 +24,17 @@ from urllib.parse import unquote
 from vless_check_config import *
 
 # ============================================================
+# УСТОЙЧИВЫЕ НАСТРОЙКИ ГЕО (работают даже без GEO_* в конфиге)
+# ============================================================
+import vless_check_config as _cfg
+
+GEO_ENABLED       = getattr(_cfg, 'GEO_ENABLED', True)
+GEO_URL           = getattr(_cfg, 'GEO_URL', "https://www.cloudflare.com/cdn-cgi/trace")
+GEO_TIMEOUT       = getattr(_cfg, 'GEO_TIMEOUT', 5)
+GEO_UNKNOWN_MARK  = getattr(_cfg, 'GEO_UNKNOWN_MARK', "UNKNOWN")
+
+
+# ============================================================
 # ЛОГИРОВАНИЕ (ротация)
 # ============================================================
 os.makedirs("/var/log", exist_ok=True)
@@ -169,9 +180,132 @@ class VlessChecker:
         links = re.findall(pattern, content)
         return links
 
-    def parse_vless_params(self, link: str) -> dict:
+    # --------------------------------------------------------
+    # ГЕО
+    # --------------------------------------------------------
+
+    def get_geo_through_xray(self, proxy_port: int, timeout: int = GEO_TIMEOUT) -> str:
+        """
+        Запрашивает гео через Xray-прокси.
+
+        Делает HTTP GET к Cloudflare trace через SOCKS5-прокси Xray.
+        В ответе ищет строку "loc=XX".
+
+        Возвращает:
+            'DE', 'NL', 'US', ... — код страны
+            GEO_UNKNOWN_MARK       — если не определилось
+        """
+        s = None
         try:
-            link_without_protocol = link[8:]
+            s = socks.socksocket()
+            s.set_proxy(socks.SOCKS5, "127.0.0.1", proxy_port)
+            s.settimeout(timeout)
+
+            # Подключаемся к Cloudflare trace через порт 443 (HTTPS)
+            s.connect(("www.cloudflare.com", 443))
+
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+
+            ssl_sock = context.wrap_socket(s, server_hostname="www.cloudflare.com")
+            s = ssl_sock
+
+            request = (
+                "GET /cdn-cgi/trace HTTP/1.1\r\n"
+                "Host: www.cloudflare.com\r\n"
+                "User-Agent: Mozilla/5.0\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            ).encode()
+
+            s.send(request)
+
+            # Читаем ответ
+            response = b""
+            while True:
+                try:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+                    # Если уже есть loc= — можно прервать
+                    if b"\nloc=" in response:
+                        break
+                except socket.timeout:
+                    break
+
+            text = response.decode('utf-8', errors='ignore')
+
+            # Ищем "loc=XX" в теле ответа
+            match = re.search(r'(?:^|\n)loc=([A-Z]{2})(?:\r?\n|$)', text)
+            if match:
+                country = match.group(1)
+                return country
+
+            return GEO_UNKNOWN_MARK
+
+        except Exception:
+            return GEO_UNKNOWN_MARK
+        finally:
+            if s:
+                try:
+                    s.close()
+                except:
+                    pass
+
+    def add_geo_to_link(self, link: str, country: str) -> str:
+        """
+        Добавляет или заменяет #COUNTRY в конце ссылки.
+
+        Если в ссылке уже есть '#' — заменяет его на '#COUNTRY'.
+        Если нет — дописывает '#COUNTRY' в конец.
+        """
+        if not country:
+            country = GEO_UNKNOWN_MARK
+
+        # Отрезаем существующий fragment (если есть)
+        if '#' in link:
+            base = link.split('#', 1)[0]
+        else:
+            base = link
+
+        return f"{base}#{country}"
+
+    def strip_geo_from_link(self, link: str) -> str:
+        """
+        Убирает #COUNTRY из ссылки (для проверки через Xray).
+        Xray не должен видеть fragment.
+        """
+        if '#' in link:
+            return link.split('#', 1)[0]
+        return link
+
+    def extract_geo_from_link(self, link: str) -> str:
+        """
+        Извлекает #COUNTRY из ссылки.
+        Возвращает:
+            'DE', 'NL', ... — если есть
+            '' — если fragment отсутствует
+        """
+        if '#' not in link:
+            return ''
+        fragment = link.split('#', 1)[1].strip()
+        # Проверяем, что это похоже на код страны (2 заглавные буквы) или UNKNOWN
+        if re.match(r'^[A-Z]{2}$', fragment) or fragment == GEO_UNKNOWN_MARK:
+            return fragment
+        return ''
+
+    # --------------------------------------------------------
+    # ПАРСИНГ И КОНФИГ XRAY
+    # --------------------------------------------------------
+
+    def parse_vless_params(self, link: str) -> dict:
+        # Отрезаем fragment — он не должен влиять на парсинг параметров
+        link_clean = self.strip_geo_from_link(link)
+
+        try:
+            link_without_protocol = link_clean[8:]
             if '@' not in link_without_protocol:
                 return {}
             before_at, after_at = link_without_protocol.split('@', 1)
@@ -224,7 +358,8 @@ class VlessChecker:
                     for line in f:
                         link = line.strip()
                         if link.startswith('vless://'):
-                            quarantine.add(link)
+                            # Карантин хранит ссылки БЕЗ гео — сравниваем по базовой части
+                            quarantine.add(self.strip_geo_from_link(link))
                 logger.info(f"Загружено {len(quarantine)} ссылок из карантина")
         except Exception as e:
             logger.error(f"Ошибка загрузки карантина: {e}")
@@ -270,7 +405,9 @@ class VlessChecker:
         }
 
         for link in links:
-            if link in quarantine:
+            # Сравниваем с карантином по базовой части (без гео)
+            link_base = self.strip_geo_from_link(link)
+            if link_base in quarantine:
                 stats['quarantine'] += 1
                 continue
 
@@ -330,7 +467,10 @@ class VlessChecker:
         return filtered
 
     def _create_xray_config(self, vless_link: str, proxy_port: int) -> dict:
-        params = self.parse_vless_params(vless_link)
+        # Отрезаем fragment — Xray не должен его видеть
+        link_clean = self.strip_geo_from_link(vless_link)
+
+        params = self.parse_vless_params(link_clean)
         if not params or 'host' not in params:
             raise ValueError("Неверный формат vless ссылки")
 
@@ -338,7 +478,7 @@ class VlessChecker:
         if not ok:
             raise ValueError(f"Невалидная Reality-ссылка: {reason}")
 
-        link_without_protocol = vless_link[8:]
+        link_without_protocol = link_clean[8:]
         uuid = link_without_protocol.split('@')[0]
         host = params['host']
         port = int(params['port'])
@@ -469,8 +609,6 @@ class VlessChecker:
             self.active_threads += 1
 
         with self.xray_semaphore:
-            # Проверяем флаг ПОСЛЕ получения семафора,
-            # чтобы не запускать Xray для уже ненужных ссылок
             if self.stop_checking or _shutdown_requested.is_set():
                 with self.threads_lock:
                     self.active_threads -= 1
@@ -513,7 +651,13 @@ class VlessChecker:
 
                     return (link, None, "PORT_TIMEOUT")
 
+                # Проверка связи
                 is_working, response_time, resp_size = self.test_https_through_proxy(proxy_port, timeout=STAGE1_TIMEOUT)
+
+                # Если работает — сразу определяем гео через тот же Xray
+                country = ""
+                if is_working and GEO_ENABLED:
+                    country = self.get_geo_through_xray(proxy_port, timeout=GEO_TIMEOUT)
 
                 self._kill_process(process)
 
@@ -546,7 +690,15 @@ class VlessChecker:
                         logger.info(f"✅ Набрано {found} рабочих ссылок! Останавливаем проверку.")
                         self.stop_checking = True
 
-                    return (link, response_time, f"OK ({resp_size} байт)")
+                    # Формируем ссылку с гео
+                    if GEO_ENABLED:
+                        link_result = self.add_geo_to_link(link, country)
+                        geo_suffix = f" [#{country}]"
+                    else:
+                        link_result = self.strip_geo_from_link(link)
+                        geo_suffix = ""
+
+                    return (link_result, response_time, f"OK ({resp_size} байт){geo_suffix}")
                 else:
                     return (link, None, "FAIL")
             except Exception as e:
@@ -577,9 +729,6 @@ class VlessChecker:
 
         results = []
 
-        # Ограничиваем количество одновременных фьючерсов,
-        # чтобы не плодить Xray для ссылок, которые уже не нужны.
-        # Работаем чанками по max_workers * 4.
         chunk_size = max(max_workers * 4, max_workers)
 
         for chunk_start in range(0, total, chunk_size):
@@ -634,8 +783,18 @@ class VlessChecker:
                 f.write(f"{link}\n")
         os.replace(tmp_file, WORKING_LINKS_FILE)
 
+        # Подсчитываем распределение по странам
+        country_stats: Dict[str, int] = {}
+        for link, _ in top_30:
+            country = self.extract_geo_from_link(link) or "NONE"
+            country_stats[country] = country_stats.get(country, 0) + 1
+
         logger.info(f"Сохранено {len(top_30)} лучших ссылок в {WORKING_LINKS_FILE}")
         logger.info(f"  Уникальных хостов: {len(host_best)}")
+
+        if GEO_ENABLED and country_stats:
+            stats_str = ", ".join(f"{k}: {v}" for k, v in sorted(country_stats.items()))
+            logger.info(f"  Гео распределение: {stats_str}")
 
 
 def main():
@@ -646,6 +805,7 @@ def main():
     logger.info(f"Режим фильтрации: {FILTER_MODE}")
     logger.info(f"Режим проверки: {CHECK_MODE}")
     logger.info(f"Метод проверки: {TEST_METHOD}")
+    logger.info(f"Гео: {'включено' if GEO_ENABLED else 'выключено'}")
     logger.info("="*60)
 
     if not os.path.exists(XRAY_PATH):
