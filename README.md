@@ -3,6 +3,7 @@
 **Каскадный VPN без аренды серверов.** Комбайн по сбору рабочих VLESS-ссылок и их автоматическому обновлению в панели 3x-ui.
 
 [![Telegram](https://img.shields.io/badge/Telegram-@PsoyNe-blue?logo=telegram)](https://t.me/PsoyNe)
+![Version](https://img.shields.io/badge/version-1.0.0-green)
 
 ---
 
@@ -29,24 +30,51 @@
 
 ## 📂 Структура проекта
 
+### На GitHub
+
+```
+vless_cascade/
+├── VERSION                    # Текущая версия
+├── CHANGELOG.md               # История изменений
+├── install.sh                 # Установщик
+├── update.sh                  # Обновлятор
+├── README.md                  # Этот файл
+├── vless_check_config.py      # Конфиг чекера
+├── vless_checker.py           # Этап 1: сбор ссылок
+├── server_tester.py           # Этап 2 (резервный)
+├── run_stage1.sh              # Обёртка этапа 1
+├── run_stage2.sh              # Обёртка этапа 2
+├── run_full_check.sh          # Полный цикл
+├── observer_config.py         # Конфиг observer'а
+├── observer.py                # Observer: трёхпоточный
+├── show_logs.sh               # Меню логов
+└── run_observer.sh            # Ручной запуск observer'а
+```
+
+### На сервере после установки
+
 ```
 /root/
-├── vless_checker/                 # Этап 1: сбор рабочих ссылок
-│   ├── vless_check_config.py      # Конфигурация
-│   ├── vless_checker.py           # Сборщик 30 лучших ссылок
-│   ├── server_tester.py           # Резервный этап 2 (не используется observer'ом)
-│   ├── run_stage1.sh              # Обёртка для запуска этапа 1
-│   ├── run_stage2.sh              # Обёртка для запуска этапа 2
-│   ├── run_full_check.sh          # Полный цикл (этап 1 + этап 2)
-│   ├── working_links.txt          # 30 рабочих ссылок (создаётся)
-│   ├── stable_links.txt           # 10 стабильных ссылок (создаётся этапом 2)
-│   └── quarantine_links.txt       # Карантин (создаётся observer'ом)
+├── .vless_cascade_version     # Установленная версия
+├── update.sh                  # Копия скрипта обновления
+├── vless_backup_*/            # Бэкапы (5 последних)
 │
-└── vless_observer/                # Observer: держит соединение живым
-    ├── observer_config.py         # Конфигурация
-    ├── observer.py                # Трёхпоточный наблюдатель
-    ├── show_logs.sh               # Меню просмотра логов и триггеров
-    └── run_observer.sh            # Обёртка для ручного запуска
+├── vless_checker/             # Этап 1
+│   ├── vless_check_config.py
+│   ├── vless_checker.py
+│   ├── server_tester.py
+│   ├── run_stage1.sh
+│   ├── run_stage2.sh
+│   ├── run_full_check.sh
+│   ├── working_links.txt      # Данные (30 ссылок)
+│   ├── stable_links.txt       # Данные (10 ссылок)
+│   └── quarantine_links.txt   # Данные (карантин)
+│
+└── vless_observer/            # Observer
+    ├── observer_config.py
+    ├── observer.py
+    ├── show_logs.sh
+    └── run_observer.sh
 ```
 
 ---
@@ -65,6 +93,8 @@
 5. Сохраняет в `working_links.txt`.
 
 **Запуск:** по cron 4 раза в сутки (**01:00, 07:00, 13:00, 19:00**).
+
+**Защита от двойного запуска:** через `flock`. Если предыдущий прогон ещё работает — новый не запустится.
 
 ### Observer: удержание связи (`observer.py`)
 
@@ -141,9 +171,12 @@ wget -qO- https://raw.githubusercontent.com/PsoyNe/vless_cascade/refs/heads/main
 ```
 
 Скрипт:
+
 - Установит зависимости.
 - Скачает чекер и observer в `/root/vless_checker/` и `/root/vless_observer/`.
-- Настроит cron на этап 1 (01:00, 07:00, 13:00, 19:00).
+- Скачает `update.sh` в `/root/update.sh`.
+- Сохранит версию в `/root/.vless_cascade_version`.
+- Настроит cron на этап 1 (01:00, 07:00, 13:00, 19:00) с защитой `flock`.
 - Создаст и запустит systemd-службу `vless_observer`.
 
 ### Шаг 5. Первый ручной запуск этапа 1
@@ -195,6 +228,118 @@ tail -f /var/log/vless_observer.log
 
 ---
 
+## 🔄 Обновление
+
+### Проверить наличие обновлений
+
+```bash
+bash /root/update.sh --check
+```
+
+**Что увидишь:**
+
+```
+Установленная версия: 1.0.0
+Версия на GitHub:     1.1.0
+Обновление доступно.
+```
+
+Или:
+
+```
+Установленная версия: 1.0.0
+Версия на GitHub:     1.0.0
+✅ У вас последняя версия.
+```
+
+### Обновить (с подтверждением)
+
+```bash
+bash /root/update.sh
+```
+
+**Что произойдёт:**
+
+1. Проверит версию на GitHub.
+2. Покажет, что нового в новой версии (из `CHANGELOG.md`).
+3. Спросит подтверждение.
+4. Создаст бэкап в `/root/vless_backup_YYYYMMDD_HHMMSS/`.
+5. Остановит observer.
+6. Скачает и обновит все файлы (кроме `working_links.txt`, `stable_links.txt`, `quarantine_links.txt`).
+7. Обновит `/root/.vless_cascade_version`.
+8. Запустит observer.
+9. Проверит, что он работает.
+
+**При успехе:**
+
+```
+✅ Версия: 1.0.0 → 1.1.0
+📁 Бэкап:  /root/vless_backup_20260914_120000
+🔄 Статус службы: active (running)
+```
+
+### Обновить без вопросов (для автоматизации)
+
+```bash
+bash /root/update.sh --auto
+```
+
+Флаг `--auto` — не задаёт вопросов, работает по умолчанию.
+
+> ⚠️ **Не рекомендуется** включать `--auto` в cron. Обновление может сломать систему, а ты узнаешь об этом только утром.
+
+### Откатиться из последнего бэкапа
+
+Если после обновления что-то пошло не так:
+
+```bash
+bash /root/update.sh --rollback
+```
+
+**Что произойдёт:**
+
+1. Найдёт последний бэкап.
+2. Покажет версию из бэкапа.
+3. Спросит подтверждение.
+4. Остановит observer.
+5. Восстановит файлы из бэкапа.
+6. Запустит observer.
+
+### Обновление одной командой
+
+Если `update.sh` уже установлен — можно обновляться **без скачивания**:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/PsoyNe/vless_cascade/main/update.sh | bash
+```
+
+Это **всегда** использует последнюю версию `update.sh` с GitHub, даже если локальная устарела.
+
+### Бэкапы
+
+Бэкапы лежат в `/root/vless_backup_YYYYMMDD_HHMMSS/`. Хранятся **5 последних**.
+
+**Содержимое бэкапа:**
+
+- `vless_checker/` — целиком.
+- `vless_observer/` — целиком.
+- `vless_observer.service` — systemd-юнит.
+- `.vless_cascade_version` — версия на момент бэкапа.
+
+Посмотреть все бэкапы:
+
+```bash
+ls -lh /root/vless_backup_*
+```
+
+Удалить все бэкапы вручную:
+
+```bash
+rm -rf /root/vless_backup_*
+```
+
+---
+
 ## 🔧 Управление
 
 ### Cron
@@ -214,14 +359,16 @@ crontab -e
 По умолчанию:
 
 ```cron
-0 1,7,13,19 * * * /usr/bin/python3 /root/vless_checker/vless_checker.py >> /var/log/vless_checker_cron.log 2>&1
+0 1,7,13,19 * * * /usr/bin/flock -n /var/run/vless_checker.lock /usr/bin/python3 /root/vless_checker/vless_checker.py >> /var/log/vless_checker_cron.log 2>&1
 ```
 
 Можно изменить на 6 раз в сутки:
 
 ```cron
-0 2,6,10,14,18,22 * * * /usr/bin/python3 /root/vless_checker/vless_checker.py >> /var/log/vless_checker_cron.log 2>&1
+0 2,6,10,14,18,22 * * * /usr/bin/flock -n /var/run/vless_checker.lock /usr/bin/python3 /root/vless_checker/vless_checker.py >> /var/log/vless_checker_cron.log 2>&1
 ```
+
+> `flock -n` — если предыдущий прогон ещё работает, новый **не запустится**. Это защита от накладок.
 
 ### Observer
 
@@ -239,10 +386,12 @@ bash /root/vless_observer/show_logs.sh
 ```
 
 В меню:
-- Просмотр логов (Observer, чекер, тестер, полный цикл).
+
+- Просмотр логов (Observer, Чекер, cron-обёртка).
 - Статистика переключений.
 - Очистка логов.
 - **Триггеры** — имитация отказа, карантин, глубокая проверка.
+- Статус служб и активных процессов.
 - Просмотр ротированных архивов логов.
 
 ---
@@ -270,10 +419,8 @@ touch /tmp/vless_deep_check_trigger    # глубокая проверка (Goog
 ```
 /var/log/
 ├── vless_checker.log         # Этап 1 (сбор ссылок)
-├── server_test.log           # Этап 2 (тестирование 180 сек)
 ├── vless_observer.log        # Observer (основной)
-├── vless_checker_cron.log    # Обёртка cron (stdout/stderr этапа 1)
-└── vless_full.log            # Полный цикл (run_full_check.sh)
+└── vless_checker_cron.log    # Обёртка cron (stdout/stderr этапа 1)
 ```
 
 **Ротация:** каждый лог автоматически ротируется в полночь. Хранится 7 архивов.
@@ -345,6 +492,13 @@ DEAD_LINK_DELETE_AFTER = 7200    # удаление мёртвых (2 часа)
 ## 🌍 Мобильный вариант
 
 Абсолютно не привязан к физическому месту. Если воткнуть в Keenetic 4G-модем — получится **мобильный передвижной сервер** с полноценным каскадом.
+
+---
+
+## 🐛 Известные особенности
+
+- **`резерв: 4/4 живых` сразу после старта observer'а** — это оптимистичное предположение. Через 30 секунд резерв реально проверяется, и статус становится честным.
+- **Этап 2 (`server_tester.py`)** работает, но его результат (`stable_links.txt`) observer'ом **не используется**. Оставлен как резервный / для отдельного анализа.
 
 ---
 
