@@ -163,6 +163,10 @@ def format_host_with_geo(link: str) -> str:
     return f"{host} [{geo}]"
 
 
+def link_base(link: str) -> str:
+    return link.split('#', 1)[0]
+
+
 def create_xray_config(link: str, proxy_port: int) -> dict:
     parsed = parse_vless_link(link)
     if not parsed:
@@ -532,6 +536,7 @@ class VlessObserver:
         self.deferred_lock = threading.Lock()
         self.stats_lock = threading.Lock()
         self.dead_links_lock = threading.Lock()
+        self.recently_primary_lock = threading.Lock()
 
         self.primary_stats = {'fail_count': 0, 'success_count': 0}
         self.switch_count = 0
@@ -552,6 +557,10 @@ class VlessObserver:
 
         self.deferred_links = {}
         self.dead_links = set()
+
+        # recently_primary: {link: timestamp} — старая основная, не возвращаем в резерв
+        # пока не истечёт RECENTLY_PRIMARY_COOLDOWN
+        self.recently_primary = {}
 
         self.switching = threading.Event()
 
@@ -598,20 +607,45 @@ class VlessObserver:
                     for line in f:
                         link = line.strip()
                         if link.startswith('vless://'):
-                            base = link.split('#', 1)[0]
-                            quarantine.add(base)
+                            quarantine.add(link_base(link))
         except Exception as e:
             logger.error(f"Ошибка загрузки карантина: {e}")
         return quarantine
 
     def _add_to_deferred(self, link: str):
-        """Добавляет ссылку в отложенные."""
         current_time = time.time()
         with self.deferred_lock:
             self.deferred_links[link] = {
                 'deferred_at': current_time,
                 'last_checked_at': current_time,
             }
+
+    def _add_to_recently_primary(self, link: str):
+        """Добавляет ссылку в recently_primary — временный игнор для резерва."""
+        if not link:
+            return
+        current_time = time.time()
+        with self.recently_primary_lock:
+            self.recently_primary[link] = current_time
+
+    def _cleanup_recently_primary(self):
+        """Удаляет устаревшие записи из recently_primary."""
+        current_time = time.time()
+        with self.recently_primary_lock:
+            expired = [
+                link for link, ts in self.recently_primary.items()
+                if current_time - ts >= RECENTLY_PRIMARY_COOLDOWN
+            ]
+            for link in expired:
+                del self.recently_primary[link]
+
+    def _is_recently_primary(self, link: str) -> bool:
+        """Проверяет, была ли ссылка недавно основной."""
+        with self.recently_primary_lock:
+            ts = self.recently_primary.get(link)
+            if ts is None:
+                return False
+            return (time.time() - ts) < RECENTLY_PRIMARY_COOLDOWN
 
     def _find_working_primary(self) -> Optional[str]:
         """Перебирает ссылки и возвращает первую живую для основной."""
@@ -658,22 +692,26 @@ class VlessObserver:
 
     def _get_candidates_from_file(self) -> List[str]:
         """
-        Возвращает список кандидатов на резерв из файла:
+        Возвращает кандидатов на резерв из файла:
         - не текущая основная
         - не в backup_pool
         - не в deferred
         - не в dead_links
         - не в карантине
+        - не в recently_primary (если кулдаун не истёк)
         """
         all_links = read_links_file(LINKS_FILE)
         if not all_links:
             return []
 
+        # Чистим устаревшие записи в recently_primary
+        self._cleanup_recently_primary()
+
         quarantine = self.load_quarantine()
 
         with self.primary_lock:
             current_primary = self.primary
-        current_primary_base = current_primary.split('#', 1)[0] if current_primary else None
+        current_primary_base = link_base(current_primary) if current_primary else None
 
         with self.pool_lock:
             pool_links = set(item['link'] for item in self.backup_pool)
@@ -684,25 +722,30 @@ class VlessObserver:
         with self.dead_links_lock:
             dead_set = set(self.dead_links)
 
+        # Снимок recently_primary
+        with self.recently_primary_lock:
+            recent_set = set(self.recently_primary.keys())
+
         candidates = []
         seen_bases = set()
 
         for link in all_links:
-            link_base = link.split('#', 1)[0]
+            l_base = link_base(link)
 
-            if link_base == current_primary_base:
+            if l_base == current_primary_base:
                 continue
             if link in pool_links:
                 continue
             if link in deferred_set or link in dead_set:
                 continue
-            if link_base in quarantine:
+            if link in recent_set:
                 continue
-            # Защита от дубликатов по базовой части
-            if link_base in seen_bases:
+            if l_base in quarantine:
+                continue
+            if l_base in seen_bases:
                 continue
 
-            seen_bases.add(link_base)
+            seen_bases.add(l_base)
             candidates.append(link)
 
         return candidates
@@ -713,7 +756,6 @@ class VlessObserver:
         Перебирает кандидатов по одному:
         - живая → в пул
         - мёртвая → в deferred, берём следующую
-        Работает, пока пул не заполнен ИЛИ кандидаты не кончились.
         """
         with self.pool_lock:
             current_size = len(self.backup_pool)
@@ -787,10 +829,7 @@ class VlessObserver:
             logger.warning(f"⚠️ Не удалось пополнить резерв (проверено кандидатов: {checked})")
 
     def _fill_backup_pool_startup(self):
-        """
-        Пополняет backup_pool при СТАРТЕ.
-        Отличается от _fill_backup_pool_checked только логами.
-        """
+        """Пополняет backup_pool при СТАРТЕ."""
         with self.pool_lock:
             current_size = len(self.backup_pool)
         need = BACKUP_POOL_SIZE - current_size
@@ -927,8 +966,18 @@ class VlessObserver:
 
         with self.stats_lock:
             switch_count = self.switch_count
+            fail_count = self.primary_stats['fail_count']
 
-        state = f"OK | {primary_display} | резерв: {alive_count}/{total_backup} живых | отложено: {deferred_count} | перекл: {switch_count}"
+        # Формируем строку статуса
+        state = f"OK | {primary_display}"
+
+        # Показываем отказы, только если они есть
+        if fail_count > 0:
+            state += f" | отказов: {fail_count}/{FAILURES_TO_SWITCH}"
+
+        state += f" | резерв: {alive_count}/{total_backup} живых"
+        state += f" | отложено: {deferred_count}"
+        state += f" | перекл: {switch_count}"
 
         if force or state != self.last_state or (current_time - self.last_log_time) >= 60:
             logger.info(state)
@@ -1408,6 +1457,13 @@ class VlessObserver:
                         self.primary_stats['fail_count'] = 0
 
                     self.critical_error_logged = False
+
+                    # C: Добавляем старую основную в recently_primary,
+                    # чтобы она 60 сек не возвращалась в резерв
+                    if old_primary:
+                        self._add_to_recently_primary(old_primary)
+                        logger.info(f"⏸️ {old_display} в recently_primary на {RECENTLY_PRIMARY_COOLDOWN}с")
+
                     self._fill_backup_pool_checked()
 
                     logger.info(f"✅ Переключение выполнено (№{self.switch_count})")
@@ -1461,6 +1517,7 @@ class VlessObserver:
         logger.info(f"Удаление отложенных: через {DEAD_LINK_DELETE_AFTER//60} минут")
         logger.info(f"Обновление пула: каждые {CHECK_INTERVAL_POOL_UPDATE}с")
         logger.info(f"Переключение: после {FAILURES_TO_SWITCH} отказов подряд")
+        logger.info(f"Защита от круговорота: {RECENTLY_PRIMARY_COOLDOWN}с")
         logger.info(f"Источник ссылок: {LINKS_FILE}")
         logger.info("="*50)
 
