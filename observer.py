@@ -107,10 +107,6 @@ def validate_reality_params(params: dict) -> Tuple[bool, str]:
 
 
 def parse_vless_link(link: str) -> Optional[dict]:
-    """
-    Парсит VLESS-ссылку.
-    Fragment (#COUNTRY) отсекается — в params его нет.
-    """
     try:
         if not link.startswith('vless://'):
             return None
@@ -146,14 +142,6 @@ def parse_vless_link(link: str) -> Optional[dict]:
 
 
 def extract_geo_from_link(link: str) -> str:
-    """
-    Извлекает #COUNTRY из ссылки.
-
-    Возвращает:
-        'DE', 'NL', 'US', ...  — корректный код страны
-        'UNKNOWN'              — если в ссылке #UNKNOWN
-        'N/A'                  — если fragment отсутствует или не распознан
-    """
     if '#' not in link:
         return 'N/A'
     fragment = link.split('#', 1)[1].strip()
@@ -167,10 +155,6 @@ def extract_geo_from_link(link: str) -> str:
 
 
 def format_host_with_geo(link: str) -> str:
-    """
-    Возвращает 'host [XX]'.
-    Если ссылка не парсится — 'unknown [N/A]'.
-    """
     parsed = parse_vless_link(link)
     if not parsed:
         return 'unknown [N/A]'
@@ -280,7 +264,6 @@ def wait_for_xray_port(proxy_port: int, timeout: float = 3.0) -> bool:
 
 
 def _kill_process(process: subprocess.Popen):
-    """Безопасное убийство процесса с ожиданием завершения."""
     if process is None:
         return
     try:
@@ -544,7 +527,6 @@ class VlessObserver:
         self.primary = None
         self.backup_pool = []
 
-        # Защита от гонок
         self.primary_lock = threading.Lock()
         self.pool_lock = threading.Lock()
         self.deferred_lock = threading.Lock()
@@ -568,7 +550,6 @@ class VlessObserver:
         self.deep_check_trigger = "/tmp/vless_deep_check_trigger"
         self.quarantine_file = "/root/vless_checker/quarantine_links.txt"
 
-        # deferred_links: {link: {'deferred_at': ts, 'last_checked_at': ts}}
         self.deferred_links = {}
         self.dead_links = set()
 
@@ -617,18 +598,23 @@ class VlessObserver:
                     for line in f:
                         link = line.strip()
                         if link.startswith('vless://'):
-                            # Отрезаем fragment — сравниваем без гео
                             base = link.split('#', 1)[0]
                             quarantine.add(base)
         except Exception as e:
             logger.error(f"Ошибка загрузки карантина: {e}")
         return quarantine
 
+    def _add_to_deferred(self, link: str):
+        """Добавляет ссылку в отложенные."""
+        current_time = time.time()
+        with self.deferred_lock:
+            self.deferred_links[link] = {
+                'deferred_at': current_time,
+                'last_checked_at': current_time,
+            }
+
     def _find_working_primary(self) -> Optional[str]:
-        """
-        Перебирает ссылки из self.links и возвращает ПЕРВУЮ ЖИВУЮ.
-        Мёртвые добавляет в dead_links. Проверяет через PROXY_PORT_PRIMARY.
-        """
+        """Перебирает ссылки и возвращает первую живую для основной."""
         total = len(self.links)
         logger.info(f"🔍 Проверяем ссылки при старте (до первой живой, максимум {total})...")
 
@@ -670,41 +656,80 @@ class VlessObserver:
 
         return None
 
-    def _fill_backup_pool(self):
+    def _get_candidates_from_file(self) -> List[str]:
         """
-        Набирает backup_pool из self.links. Пропускает:
-        - текущую основную
-        - уже в dead_links
-        - уже в deferred_links
-        - карантин
-        Каждая ссылка проверяется через PROXY_PORT_BACKUP.
+        Возвращает список кандидатов на резерв из файла:
+        - не текущая основная
+        - не в backup_pool
+        - не в deferred
+        - не в dead_links
+        - не в карантине
         """
+        all_links = read_links_file(LINKS_FILE)
+        if not all_links:
+            return []
+
         quarantine = self.load_quarantine()
 
-        with self.pool_lock:
-            existing_links = set(item['link'] for item in self.backup_pool)
-        with self.deferred_lock:
-            deferred_set = set(self.deferred_links.keys())
-        with self.dead_links_lock:
-            dead_set = set(self.dead_links)
         with self.primary_lock:
             current_primary = self.primary
-
-        # Сравниваем без гео
         current_primary_base = current_primary.split('#', 1)[0] if current_primary else None
 
-        candidates = []
-        for l in self.links:
-            l_base = l.split('#', 1)[0]
-            if l_base == current_primary_base:
-                continue
-            if l in existing_links:
-                continue
-            if l in deferred_set or l in dead_set or l in quarantine or l_base in quarantine:
-                continue
-            candidates.append(l)
+        with self.pool_lock:
+            pool_links = set(item['link'] for item in self.backup_pool)
 
-        logger.info(f"🔍 Набираем резерв (цель: {BACKUP_POOL_SIZE}), кандидатов: {len(candidates)}")
+        with self.deferred_lock:
+            deferred_set = set(self.deferred_links.keys())
+
+        with self.dead_links_lock:
+            dead_set = set(self.dead_links)
+
+        candidates = []
+        seen_bases = set()
+
+        for link in all_links:
+            link_base = link.split('#', 1)[0]
+
+            if link_base == current_primary_base:
+                continue
+            if link in pool_links:
+                continue
+            if link in deferred_set or link in dead_set:
+                continue
+            if link_base in quarantine:
+                continue
+            # Защита от дубликатов по базовой части
+            if link_base in seen_bases:
+                continue
+
+            seen_bases.add(link_base)
+            candidates.append(link)
+
+        return candidates
+
+    def _fill_backup_pool_checked(self):
+        """
+        Пополняет backup_pool ЖИВЫМИ ссылками.
+        Перебирает кандидатов по одному:
+        - живая → в пул
+        - мёртвая → в deferred, берём следующую
+        Работает, пока пул не заполнен ИЛИ кандидаты не кончились.
+        """
+        with self.pool_lock:
+            current_size = len(self.backup_pool)
+        need = BACKUP_POOL_SIZE - current_size
+
+        if need <= 0:
+            return
+
+        logger.info(f"🔍 Пополняем резерв (нужно: {need}, в пуле: {current_size}/{BACKUP_POOL_SIZE})...")
+
+        candidates = self._get_candidates_from_file()
+        if not candidates:
+            logger.warning("⚠️ Нет кандидатов для пополнения резерва")
+            return
+
+        logger.info(f"📋 Кандидатов из файла: {len(candidates)}")
 
         added = 0
         checked = 0
@@ -712,8 +737,84 @@ class VlessObserver:
         for link in candidates:
             if _shutdown_requested.is_set():
                 return
-            if added >= BACKUP_POOL_SIZE:
-                break
+
+            with self.pool_lock:
+                if len(self.backup_pool) >= BACKUP_POOL_SIZE:
+                    break
+
+            checked += 1
+            parsed = parse_vless_link(link)
+            if not parsed:
+                with self.dead_links_lock:
+                    self.dead_links.add(link)
+                continue
+
+            display = format_host_with_geo(link)
+            country = extract_geo_from_link(link)
+
+            ok, reason = validate_reality_params(parsed['params'])
+            if not ok:
+                with self.dead_links_lock:
+                    self.dead_links.add(link)
+                continue
+
+            logger.info(f"🔎 Проверяем кандидата [{checked}]: {display}...")
+
+            is_working, ping, _ = test_link_through_xray(
+                link,
+                PROXY_PORT_BACKUP,
+                timeout=BACKUP_TEST_TIMEOUT
+            )
+
+            if is_working:
+                with self.pool_lock:
+                    self.backup_pool.append({
+                        'link': link,
+                        'host': parsed['host'],
+                        'country': country,
+                        'alive': True,
+                        'ping': ping
+                    })
+                added += 1
+                logger.info(f"✅ {display} живая — в резерв [{current_size + added}/{BACKUP_POOL_SIZE}] (пинг: {ping:.0f}мс)")
+            else:
+                self._add_to_deferred(link)
+                logger.warning(f"❌ {display} мертва — в deferred")
+
+        if added > 0:
+            logger.info(f"✅ Резерв пополнен: +{added} (проверено кандидатов: {checked})")
+        else:
+            logger.warning(f"⚠️ Не удалось пополнить резерв (проверено кандидатов: {checked})")
+
+    def _fill_backup_pool_startup(self):
+        """
+        Пополняет backup_pool при СТАРТЕ.
+        Отличается от _fill_backup_pool_checked только логами.
+        """
+        with self.pool_lock:
+            current_size = len(self.backup_pool)
+        need = BACKUP_POOL_SIZE - current_size
+
+        if need <= 0:
+            return
+
+        logger.info(f"🔍 Набираем резерв (цель: {BACKUP_POOL_SIZE})...")
+
+        candidates = self._get_candidates_from_file()
+        if not candidates:
+            logger.warning("⚠️ Нет кандидатов для резерва")
+            return
+
+        added = 0
+        checked = 0
+
+        for link in candidates:
+            if _shutdown_requested.is_set():
+                return
+
+            with self.pool_lock:
+                if len(self.backup_pool) >= BACKUP_POOL_SIZE:
+                    break
 
             checked += 1
             parsed = parse_vless_link(link)
@@ -751,12 +852,7 @@ class VlessObserver:
                 added += 1
                 logger.info(f"✅ Резерв [{added}/{BACKUP_POOL_SIZE}] {display} (пинг: {ping:.0f}мс)")
             else:
-                current_time = time.time()
-                with self.deferred_lock:
-                    self.deferred_links[link] = {
-                        'deferred_at': current_time,
-                        'last_checked_at': current_time,
-                    }
+                self._add_to_deferred(link)
                 logger.warning(f"❌ Резерв {display} мертва — в deferred")
 
         if added < BACKUP_POOL_SIZE:
@@ -764,7 +860,6 @@ class VlessObserver:
                           f"Проверено кандидатов: {checked}.")
 
     def init_pool(self) -> bool:
-        """Инициализация пула при старте."""
         primary = self._find_working_primary()
 
         if not primary:
@@ -775,7 +870,6 @@ class VlessObserver:
         with self.primary_lock:
             self.primary = primary
 
-        parsed_primary = parse_vless_link(primary)
         primary_display = format_host_with_geo(primary)
 
         logger.info(f"📝 Устанавливаем основную в outbound: {primary_display}")
@@ -786,7 +880,7 @@ class VlessObserver:
         if not reload_xray():
             logger.error("❌ Не удалось перезапустить x-ui.")
 
-        self._fill_backup_pool()
+        self._fill_backup_pool_startup()
 
         with self.pool_lock:
             total_backup = len(self.backup_pool)
@@ -942,7 +1036,7 @@ class VlessObserver:
             backup_snapshot = list(self.backup_pool)
 
         if not backup_snapshot:
-            self.refill_pool_excluding_deferred()
+            self._fill_backup_pool_checked()
             return
 
         self.backup_check_counter += 1
@@ -980,20 +1074,15 @@ class VlessObserver:
                 self.backup_pool = [item for item in self.backup_pool if item['link'] not in dead_links]
 
         if dead_links:
-            current_time = time.time()
-            with self.deferred_lock:
-                for link in dead_links:
-                    self.deferred_links[link] = {
-                        'deferred_at': current_time,
-                        'last_checked_at': current_time,
-                    }
+            for link in dead_links:
+                self._add_to_deferred(link)
 
             logger.warning(f"⚠️ Отложено {len(dead_links)} ссылок")
 
             with self.pool_lock:
                 need_refill = len(self.backup_pool) < BACKUP_POOL_SIZE
             if need_refill:
-                self.refill_pool_excluding_deferred()
+                self._fill_backup_pool_checked()
 
         with self.pool_lock:
             self.backup_pool.sort(key=lambda x: (not x.get('alive', False), x.get('ping', 9999)))
@@ -1002,7 +1091,7 @@ class VlessObserver:
 
         if alive_count == 0 and total > 0:
             logger.warning("⚠️ Все резервные ссылки мертвы! Пополнение пула...")
-            self.refill_pool_excluding_deferred()
+            self._fill_backup_pool_checked()
 
     # --------------------------------------------------------
     # ПОТОК 3: отложенные + обновление пула
@@ -1125,145 +1214,19 @@ class VlessObserver:
                     logger.warning(f"❌ Отложенная ссылка {display} всё ещё мертва ({total_elapsed_min} мин в deferred)")
 
     def update_pool_from_file(self):
+        """Обновляет self.links из файла. Не трогает backup_pool."""
         current_time = time.time()
         if current_time - self.last_pool_update_time < POOL_UPDATE_INTERVAL:
             return
 
-        all_links = read_links_file(LINKS_FILE)
-        if len(all_links) < 2:
-            self.last_pool_update_time = current_time
-            return
+        new_links = read_links_file(LINKS_FILE)
+        if len(new_links) >= 2:
+            old_count = len(self.links)
+            self.links = new_links
+            if old_count != len(new_links):
+                logger.info(f"📥 Файл перечитан: {old_count} → {len(new_links)} ссылок")
 
-        try:
-            quarantine = self.load_quarantine()
-
-            with self.primary_lock:
-                current_primary = self.primary
-
-            current_primary_base = current_primary.split('#', 1)[0] if current_primary else None
-
-            with self.pool_lock:
-                current_links = set()
-                if current_primary:
-                    current_links.add(current_primary)
-                for item in self.backup_pool:
-                    current_links.add(item['link'])
-
-                with self.deferred_lock:
-                    deferred_set = set(self.deferred_links.keys())
-
-                with self.dead_links_lock:
-                    dead_set = set(self.dead_links)
-
-                new_links = []
-                for l in all_links:
-                    l_base = l.split('#', 1)[0]
-                    if l in current_links:
-                        continue
-                    if l in dead_set or l in deferred_set:
-                        continue
-                    if l_base in quarantine:
-                        continue
-                    if l_base == current_primary_base:
-                        continue
-                    new_links.append(l)
-
-                if not new_links:
-                    self.last_pool_update_time = current_time
-                    return
-
-                logger.info(f"📥 Найдено {len(new_links)} новых ссылок")
-                added_count = 0
-
-                for link in new_links:
-                    if len(self.backup_pool) >= BACKUP_POOL_SIZE:
-                        break
-                    parsed = parse_vless_link(link)
-                    if not parsed:
-                        continue
-                    ok, reason = validate_reality_params(parsed['params'])
-                    if not ok:
-                        with self.dead_links_lock:
-                            self.dead_links.add(link)
-                        continue
-                    country = extract_geo_from_link(link)
-                    self.backup_pool.append({
-                        'link': link,
-                        'host': parsed['host'],
-                        'country': country,
-                        'alive': True,
-                        'ping': 0
-                    })
-                    added_count += 1
-                    logger.info(f"➕ Добавлена новая резервная: {parsed['host']} [{country}]")
-
-            if added_count > 0:
-                logger.info(f"✅ Добавлено {added_count} новых ссылок")
-                self.log_status(force=True)
-
-            self.last_pool_update_time = current_time
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка обновления пула: {e}")
-            self.last_pool_update_time = current_time
-
-    def refill_pool_excluding_deferred(self):
-        all_links = read_links_file(LINKS_FILE)
-        if not all_links:
-            return
-
-        try:
-            quarantine = self.load_quarantine()
-
-            with self.primary_lock:
-                current = self.primary
-
-            current_base = current.split('#', 1)[0] if current else None
-
-            with self.pool_lock:
-                existing_links = [item['link'] for item in self.backup_pool]
-                with self.deferred_lock:
-                    deferred_set = set(self.deferred_links.keys())
-                with self.dead_links_lock:
-                    dead_set = set(self.dead_links)
-
-                available = []
-                for l in all_links:
-                    l_base = l.split('#', 1)[0]
-                    if l_base == current_base:
-                        continue
-                    if l in existing_links or l in deferred_set or l in dead_set:
-                        continue
-                    if l_base in quarantine:
-                        continue
-                    available.append(l)
-
-                if not available:
-                    return
-
-                for link in available[:BACKUP_POOL_SIZE - len(self.backup_pool)]:
-                    parsed = parse_vless_link(link)
-                    if not parsed:
-                        continue
-                    ok, reason = validate_reality_params(parsed['params'])
-                    if not ok:
-                        with self.dead_links_lock:
-                            self.dead_links.add(link)
-                        continue
-                    country = extract_geo_from_link(link)
-                    self.backup_pool.append({
-                        'link': link,
-                        'host': parsed['host'],
-                        'country': country,
-                        'alive': True,
-                        'ping': 0
-                    })
-                    logger.info(f"➕ Добавлена новая резервная: {parsed['host']} [{country}]")
-
-            self.last_pool_refill_time = time.time()
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка пополнения пула: {e}")
+        self.last_pool_update_time = current_time
 
     # --------------------------------------------------------
     # Триггеры
@@ -1402,8 +1365,8 @@ class VlessObserver:
                 ]
 
             if not alive_backups:
-                logger.warning("⚠️ Нет живых резервных! Пополнение пула...")
-                self.refill_pool_excluding_deferred()
+                logger.warning("⚠️ Нет живых резервных! Пополняем пул...")
+                self._fill_backup_pool_checked()
 
                 with self.pool_lock:
                     alive_backups = [
@@ -1445,7 +1408,7 @@ class VlessObserver:
                         self.primary_stats['fail_count'] = 0
 
                     self.critical_error_logged = False
-                    self.refill_pool_excluding_deferred()
+                    self._fill_backup_pool_checked()
 
                     logger.info(f"✅ Переключение выполнено (№{self.switch_count})")
                     self.log_status(force=True)
