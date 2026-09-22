@@ -283,7 +283,8 @@ fi
 if [ -z "$OBSERVER_SKIP" ]; then
     mkdir -p "$OBSERVER_DIR"
 
-    OBSERVER_FILES="observer_config.py observer.py show_logs.sh run_observer.sh"
+    # ВАЖНО: observer.py зависит от vless_common.py и triggers.py
+    OBSERVER_FILES="observer_config.py vless_common.py triggers.py observer.py show_logs.sh run_observer.sh"
     NUM_OBSERVER_FILES=$(echo "$OBSERVER_FILES" | wc -w)
     progress_bar_init "Observer" "$NUM_OBSERVER_FILES"
 
@@ -302,7 +303,6 @@ fi
 # ============================================================
 print_header "УСТАНОВКА СКРИПТОВ ОБСЛУЖИВАНИЯ"
 
-# update.sh
 print_info "Скачиваем update.sh..."
 if download_file "$GITHUB_RAW/update.sh" "$UPDATE_SCRIPT_PATH" "update.sh"; then
     chmod +x "$UPDATE_SCRIPT_PATH"
@@ -312,7 +312,6 @@ else
     print_warning "Автообновление будет недоступно."
 fi
 
-# merge_config.py
 print_info "Скачиваем merge_config.py..."
 if download_file "$GITHUB_RAW/merge_config.py" "$MERGE_SCRIPT_PATH" "merge_config.py"; then
     chmod +x "$MERGE_SCRIPT_PATH"
@@ -334,8 +333,6 @@ print_success "Версия сохранена: $VERSION_FILE_LOCAL"
 # ============================================================
 print_header "НАСТРОЙКА CRON ДЛЯ ЧЕКЕРА"
 
-# Этап 1 запускается 4 раза в сутки: 01:00, 07:00, 13:00, 19:00
-# flock -n защищает от двойного запуска, если предыдущий прогон ещё работает
 CRON_JOB='0 1,7,13,19 * * * /usr/bin/flock -n /var/run/vless_checker.lock /usr/bin/python3 /root/vless_checker/vless_checker.py >> /var/log/vless_checker_cron.log 2>&1'
 
 if crontab -l 2>/dev/null | grep -q "vless_checker"; then
@@ -420,6 +417,20 @@ else
     print_warning "Ошибка импорта конфига обсерватории"
 fi
 
+print_info "Проверка vless_common.py..."
+if python3 -c "import sys; sys.path.insert(0, '/root/vless_observer'); import vless_common" 2>/dev/null; then
+    print_success "Модуль vless_common корректен"
+else
+    print_warning "Ошибка импорта vless_common"
+fi
+
+print_info "Проверка triggers.py..."
+if python3 -c "import sys; sys.path.insert(0, '/root/vless_observer'); import triggers" 2>/dev/null; then
+    print_success "Модуль triggers корректен"
+else
+    print_warning "Ошибка импорта triggers"
+fi
+
 print_info "Проверка Python модулей..."
 if python3 -c "import requests, socks, ssl, sqlite3" 2>/dev/null; then
     print_success "Все модули установлены"
@@ -486,6 +497,18 @@ echo "🔧 Триггеры Observer:"
 echo "  touch /tmp/vless_observer_trigger    # имитация отказа"
 echo "  touch /tmp/vless_quarantine_trigger  # отправить основную в карантин"
 echo "  touch /tmp/vless_deep_check_trigger  # глубокая проверка"
+echo ""
+echo "🤖 Триггеры для бота (команды):"
+echo "  touch /tmp/vless_status_trigger            # статус"
+echo "  touch /tmp/vless_links_trigger             # список ссылок"
+echo "  touch /tmp/vless_switch_trigger            # переключиться"
+echo "  touch /tmp/vless_geo_DE                    # на страну DE"
+echo "  touch /tmp/vless_pick_46.28.69.53          # на конкретный host"
+echo "  touch /tmp/vless_ignore_46.28.69.53        # в карантин"
+echo "  touch /tmp/vless_unignore_46.28.69.53      # из карантина"
+echo "  touch /tmp/vless_reload_trigger            # перечитать файл ссылок"
+echo ""
+echo "  Ответы: /tmp/vless_<action>_response (JSON)"
 echo ""
 echo "📋 Просмотр логов через меню:"
 echo "  bash $OBSERVER_DIR/show_logs.sh"
