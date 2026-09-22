@@ -1,27 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import json
-import sqlite3
 import os
 import sys
 import time
+import signal
 import logging
 import logging.handlers
-import subprocess
-import signal
-import socket
-import socks
-import ssl
-import re
-import tempfile
-import shutil
 import threading
-from urllib.parse import unquote
-from datetime import datetime
 from typing import List, Tuple, Optional, Dict
 
 from observer_config import *
+
+from vless_common import (
+    parse_vless_link,
+    extract_geo_from_link,
+    format_host_with_geo,
+    link_base,
+    validate_reality_params,
+    read_links_file,
+    test_link_through_xray,
+    test_link_deep,
+    update_3xui_outbound,
+    reload_xray,
+)
+
+from triggers import (
+    check_and_handle,
+    cleanup_triggers_on_startup,
+)
+
 
 # ============================================================
 # НАСТРОЙКА ЛОГИРОВАНИЯ
@@ -49,6 +57,14 @@ if sys.stdout.isatty():
     console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S'))
     logger.addHandler(console_handler)
 
+# Логгер для vless_common и triggers — чтобы их сообщения тоже шли сюда
+for mod_name in ('vless_common', 'triggers'):
+    mod_logger = logging.getLogger(mod_name)
+    mod_logger.setLevel(logging.INFO)
+    mod_logger.addHandler(file_handler)
+    if sys.stdout.isatty():
+        mod_logger.addHandler(console_handler)
+
 
 # ============================================================
 # ГЛОБАЛЬНЫЙ ФЛАГ ОСТАНОВКИ
@@ -66,459 +82,28 @@ signal.signal(signal.SIGINT, _handle_sigterm)
 
 
 # ============================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ПРИОРИТЕТНАЯ СТРАНА
 # ============================================================
 
-def read_links_file(path: str) -> List[str]:
-    for attempt in range(FILE_READ_RETRIES):
-        try:
-            if not os.path.exists(path):
-                time.sleep(FILE_READ_RETRY_DELAY)
-                continue
-            with open(path, 'r', encoding='utf-8') as f:
-                lines = [line.strip() for line in f if line.strip().startswith('vless://')]
-            if lines:
-                return lines
-            time.sleep(FILE_READ_RETRY_DELAY)
-        except Exception as e:
-            logger.error(f"Ошибка чтения {path}: {e}")
-            time.sleep(FILE_READ_RETRY_DELAY)
-    return []
-
-
-def validate_reality_params(params: dict) -> Tuple[bool, str]:
-    security = params.get('security', '').lower()
-    if security != 'reality':
-        return True, ''
-
-    pbk = params.get('pbk', '').strip()
-    if not pbk:
-        return False, 'пустой publicKey (pbk)'
-
-    sid = params.get('sid', '').strip()
-    if sid and len(sid) > 16:
-        return False, f'подозрительная длина shortId: {len(sid)}'
-
-    sni = params.get('sni', '').strip()
-    if not sni:
-        return False, 'пустой serverName (sni)'
-
-    return True, ''
-
-
-def parse_vless_link(link: str) -> Optional[dict]:
-    try:
-        if not link.startswith('vless://'):
-            return None
-        link_without_protocol = link[8:]
-        if '@' not in link_without_protocol:
-            return None
-        uuid, after_at = link_without_protocol.split('@', 1)
-        if ':' not in after_at:
-            return None
-        host_port, rest = after_at.split(':', 1)
-        if '?' in rest:
-            port, params_str = rest.split('?', 1)
-        else:
-            port = rest
-            params_str = ''
-        params = {}
-        if params_str:
-            if '#' in params_str:
-                params_str = params_str.split('#')[0]
-            for param in params_str.split('&'):
-                if '=' in param:
-                    key, value = param.split('=', 1)
-                    params[key] = unquote(value)
-        return {
-            'uuid': uuid,
-            'host': host_port,
-            'port': int(port),
-            'params': params
-        }
-    except Exception as e:
-        logger.error(f"Ошибка парсинга: {e}")
-        return None
-
-
-def extract_geo_from_link(link: str) -> str:
-    if '#' not in link:
-        return 'N/A'
-    fragment = link.split('#', 1)[1].strip()
-    if not fragment:
-        return 'N/A'
-    if re.match(r'^[A-Z]{2}$', fragment):
-        return fragment
-    if fragment == "UNKNOWN":
-        return "UNKNOWN"
-    return 'N/A'
-
-
-def format_host_with_geo(link: str) -> str:
-    parsed = parse_vless_link(link)
-    if not parsed:
-        return 'unknown [N/A]'
-    host = parsed['host']
-    geo = extract_geo_from_link(link)
-    return f"{host} [{geo}]"
-
-
-def link_base(link: str) -> str:
-    return link.split('#', 1)[0]
-
-
-def create_xray_config(link: str, proxy_port: int) -> dict:
-    parsed = parse_vless_link(link)
-    if not parsed:
-        raise ValueError("Неверный формат vless ссылки")
-
-    ok, reason = validate_reality_params(parsed['params'])
-    if not ok:
-        raise ValueError(f"Невалидная Reality-ссылка: {reason}")
-
-    uuid = parsed['uuid']
-    host = parsed['host']
-    port = parsed['port']
-
-    reality_settings = {
-        "serverName": parsed['params'].get('sni', host),
-        "fingerprint": parsed['params'].get('fp', 'chrome'),
-        "publicKey": parsed['params'].get('pbk', ''),
-        "shortId": parsed['params'].get('sid', ''),
-        "spiderX": "",
-        "mldsa65Verify": ""
-    }
-
-    spx = parsed['params'].get('spx', '')
-    if spx:
-        spx_clean = re.sub(r'[^a-zA-Z0-9/]', '', spx)
-        if spx_clean:
-            reality_settings["spiderX"] = spx_clean
-
-    config = {
-        "log": {"loglevel": "error"},
-        "inbounds": [{
-            "port": proxy_port,
-            "protocol": "socks",
-            "settings": {"auth": "noauth", "udp": True}
-        }],
-        "outbounds": [{
-            "protocol": "vless",
-            "settings": {
-                "vnext": [{
-                    "address": host,
-                    "port": port,
-                    "users": [{
-                        "id": uuid,
-                        "encryption": parsed['params'].get('encryption', 'none'),
-                        "flow": parsed['params'].get('flow', ''),
-                        "level": 0
-                    }]
-                }]
-            },
-            "streamSettings": {
-                "network": parsed['params'].get('type', 'tcp'),
-                "security": parsed['params'].get('security', 'reality'),
-                "tcpSettings": {"header": {"type": "none"}},
-                "realitySettings": reality_settings
-            }
-        }]
-    }
-
-    if 'streamSettings' in config['outbounds'][0]:
-        stream = config['outbounds'][0]['streamSettings']
-        if stream.get('realitySettings') is None:
-            del stream['realitySettings']
-
-    return config
-
-
-def start_xray(config_path: str, xray_path: str = XRAY_PATH) -> subprocess.Popen:
-    cmd = [xray_path, "-config", config_path]
-    env = os.environ.copy()
-    env['XRAY_LOCATION_ASSET'] = '/usr/local/share/xray'
-
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        preexec_fn=os.setsid if hasattr(os, 'setsid') else None,
-        env=env
-    )
-
-    return process
-
-
-def wait_for_xray_port(proxy_port: int, timeout: float = 3.0) -> bool:
-    start = time.time()
-    while time.time() - start < timeout:
-        if _shutdown_requested.is_set():
-            return False
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(0.2)
-            result = sock.connect_ex(('127.0.0.1', proxy_port))
-            sock.close()
-            if result == 0:
-                return True
-        except:
-            pass
-        time.sleep(0.05)
-    return False
-
-
-def _kill_process(process: subprocess.Popen):
-    if process is None:
-        return
-    try:
-        process.terminate()
-        try:
-            process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
-    except Exception:
-        pass
-
-
-def test_link_through_xray(link: str, proxy_port: int, timeout: int = TEST_TIMEOUT) -> Tuple[bool, float, int]:
-    temp_dir = tempfile.mkdtemp(prefix="observer_test_")
-    process = None
-    s = None
-    start_time = time.time()
-
-    try:
-        config = create_xray_config(link, proxy_port)
-        config_path = os.path.join(temp_dir, "config.json")
-        with open(config_path, 'w') as f:
-            json.dump(config, f, indent=2)
-
-        process = start_xray(config_path)
-
-        if not wait_for_xray_port(proxy_port, timeout=3.0):
-            return (False, 0, 0)
-
-        s = socks.socksocket()
-        s.set_proxy(socks.SOCKS5, "127.0.0.1", proxy_port)
-        s.settimeout(timeout)
-
-        s.connect((TEST_HOST, TEST_PORT))
-
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-
-        ssl_sock = context.wrap_socket(s, server_hostname=TEST_HOST)
-        s = ssl_sock
-
-        request = f"HEAD {TEST_PATH} HTTP/1.1\r\nHost: {TEST_HOST}\r\nConnection: close\r\n\r\n".encode()
-        s.send(request)
-
-        response = s.recv(TEST_BUFFER_SIZE)
-        elapsed = (time.time() - start_time) * 1000
-
-        if response and (b"204" in response or b"200" in response):
-            return (True, elapsed, len(response))
-        else:
-            return (False, elapsed, len(response))
-
-    except Exception:
-        elapsed = (time.time() - start_time) * 1000
-        return (False, elapsed, 0)
-    finally:
-        if s:
-            try:
-                s.close()
-            except:
-                pass
-        _kill_process(process)
-        try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
-            pass
-
-
-def test_link_deep(link: str, proxy_port: int, timeout: int = DEEP_CHECK_TIMEOUT) -> Tuple[bool, float, str]:
-    temp_dir = tempfile.mkdtemp(prefix="observer_deep_")
-    process = None
-    start_time = time.time()
-
-    try:
-        config = create_xray_config(link, proxy_port)
-        config_path = os.path.join(temp_dir, "config.json")
-        with open(config_path, 'w') as f:
-            json.dump(config, f, indent=2)
-
-        process = start_xray(config_path)
-
-        if not wait_for_xray_port(proxy_port, timeout=3.0):
-            return (False, 0, "")
-
-        for test_host in DEEP_CHECK_HOSTS:
-            if _shutdown_requested.is_set():
-                return (False, 0, "")
-            s = None
-            try:
-                start_time = time.time()
-                s = socks.socksocket()
-                s.set_proxy(socks.SOCKS5, "127.0.0.1", proxy_port)
-                s.settimeout(timeout)
-
-                s.connect((test_host, DEEP_CHECK_PORT))
-
-                context = ssl.create_default_context()
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
-
-                ssl_sock = context.wrap_socket(s, server_hostname=test_host)
-                s = ssl_sock
-
-                request = f"HEAD {DEEP_CHECK_PATH} HTTP/1.1\r\nHost: {test_host}\r\nConnection: close\r\n\r\n".encode()
-                s.send(request)
-
-                response = s.recv(TEST_BUFFER_SIZE)
-                elapsed = (time.time() - start_time) * 1000
-
-                if response and DEEP_CHECK_EXPECTED_STRING in response:
-                    logger.info(f"✅ Глубокая проверка: {test_host} доступен ({elapsed:.0f}мс)")
-                    return (True, elapsed, test_host)
-                else:
-                    logger.warning(f"⚠️ Глубокая проверка: {test_host} не ответил")
-            except Exception as e:
-                logger.warning(f"⚠️ Глубокая проверка: {test_host} ошибка — {str(e)[:50]}")
-            finally:
-                if s:
-                    try:
-                        s.close()
-                    except:
-                        pass
-
-        return (False, 0, "")
-
-    except Exception as e:
-        logger.error(f"Ошибка глубокой проверки: {e}")
-        return (False, 0, "")
-    finally:
-        _kill_process(process)
-        try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
-            pass
-
-
-def create_outbound_config(link: str, name: str) -> Optional[dict]:
-    parsed = parse_vless_link(link)
-    if not parsed:
-        return None
-
-    ok, reason = validate_reality_params(parsed['params'])
-    if not ok:
-        logger.error(f"Невалидная ссылка для outbound: {reason}")
-        return None
-
-    reality_settings = {
-        "serverName": parsed['params'].get('sni', parsed['host']),
-        "fingerprint": parsed['params'].get('fp', 'chrome'),
-        "publicKey": parsed['params'].get('pbk', ''),
-        "shortId": parsed['params'].get('sid', ''),
-        "spiderX": "",
-        "mldsa65Verify": ""
-    }
-    spx = parsed['params'].get('spx', '')
-    if spx:
-        spx_clean = re.sub(r'[^a-zA-Z0-9/]', '', spx)
-        if spx_clean:
-            reality_settings["spiderX"] = spx_clean
-
-    outbound = {
-        "tag": name,
-        "protocol": "vless",
-        "settings": {
-            "address": parsed['host'],
-            "port": parsed['port'],
-            "id": parsed['uuid'],
-            "flow": parsed['params'].get('flow', ''),
-            "encryption": parsed['params'].get('encryption', 'none'),
-            "testseed": [900, 500, 900, 256]
-        },
-        "streamSettings": {
-            "network": parsed['params'].get('type', 'tcp'),
-            "security": parsed['params'].get('security', 'reality'),
-            "tcpSettings": {
-                "header": {
-                    "type": "none"
-                }
-            },
-            "realitySettings": reality_settings
-        }
-    }
-    return outbound
-
-
-def update_3xui_outbound(link: str, name: str = OUTBOUND_NAME) -> bool:
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM settings WHERE key = 'xrayTemplateConfig'")
-        row = cursor.fetchone()
-        if not row:
-            logger.error("xrayTemplateConfig не найден!")
-            conn.close()
-            return False
-        config = json.loads(row[0])
-        outbounds = config.get('outbounds', [])
-        new_outbound = create_outbound_config(link, name)
-        if not new_outbound:
-            logger.error(f"Не удалось создать конфиг для {name}")
-            conn.close()
-            return False
-        found = False
-        for i, outbound in enumerate(outbounds):
-            if outbound.get('tag') == name:
-                outbounds[i] = new_outbound
-                found = True
-                logger.info(f"✅ Обновлен outbound: {name}")
-                break
-        if not found:
-            outbounds.append(new_outbound)
-            logger.info(f"➕ Добавлен outbound: {name}")
-        config['outbounds'] = outbounds
-        cursor.execute(
-            "UPDATE settings SET value = ? WHERE key = 'xrayTemplateConfig'",
-            (json.dumps(config, indent=2),)
-        )
-        conn.commit()
-        conn.close()
-        logger.info(f"✅ Outbound {name} обновлен в БД")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Ошибка обновления 3x-ui: {e}")
-        return False
-
-
-def reload_xray() -> bool:
-    try:
-        result = subprocess.run(
-            ['systemctl', 'restart', 'x-ui'],
-            capture_output=True,
-            text=True,
-            timeout=15
-        )
-        if result.returncode == 0:
-            logger.info("✅ x-ui перезапущен через systemctl")
-            return True
-        else:
-            logger.error(f"❌ systemctl restart x-ui вернул {result.returncode}: {result.stderr.strip()[:200]}")
-            return False
-    except subprocess.TimeoutExpired:
-        logger.error("❌ Таймаут перезапуска x-ui (15 сек)")
-        return False
-    except Exception as e:
-        logger.error(f"❌ Не удалось перезапустить x-ui: {e}")
-        return False
+def _normalize_preferred_country() -> str:
+    """
+    Возвращает валидный код приоритетной страны или '' (нет приоритета).
+    Невалидный код игнорируется с предупреждением в лог.
+    """
+    raw = getattr(__import__('observer_config'), 'PREFERRED_COUNTRY', '')
+    if not raw:
+        return ''
+    raw = str(raw).strip().upper()
+    if not raw:
+        return ''
+    import re
+    if re.match(r'^[A-Z]{2}$', raw):
+        return raw
+    logger.warning(f"⚠️ PREFERRED_COUNTRY='{raw}' — невалидный код страны, приоритет отключён")
+    return ''
+
+
+PREFERRED_COUNTRY = _normalize_preferred_country()
 
 
 # ============================================================
@@ -557,9 +142,6 @@ class VlessObserver:
 
         self.deferred_links = {}
         self.dead_links = set()
-
-        # recently_primary: {link: timestamp} — старая основная, не возвращаем в резерв
-        # пока не истечёт RECENTLY_PRIMARY_COOLDOWN
         self.recently_primary = {}
 
         self.switching = threading.Event()
@@ -621,7 +203,6 @@ class VlessObserver:
             }
 
     def _add_to_recently_primary(self, link: str):
-        """Добавляет ссылку в recently_primary — временный игнор для резерва."""
         if not link:
             return
         current_time = time.time()
@@ -629,7 +210,6 @@ class VlessObserver:
             self.recently_primary[link] = current_time
 
     def _cleanup_recently_primary(self):
-        """Удаляет устаревшие записи из recently_primary."""
         current_time = time.time()
         with self.recently_primary_lock:
             expired = [
@@ -639,20 +219,40 @@ class VlessObserver:
             for link in expired:
                 del self.recently_primary[link]
 
-    def _is_recently_primary(self, link: str) -> bool:
-        """Проверяет, была ли ссылка недавно основной."""
-        with self.recently_primary_lock:
-            ts = self.recently_primary.get(link)
-            if ts is None:
-                return False
-            return (time.time() - ts) < RECENTLY_PRIMARY_COOLDOWN
+    def _sort_links_by_preferred(self, links: List[str]) -> List[str]:
+        """
+        Сортирует ссылки так, чтобы ссылки с PREFERRED_COUNTRY шли первыми.
+        Если PREFERRED_COUNTRY пуст — возвращает как есть.
+        """
+        if not PREFERRED_COUNTRY:
+            return links
+
+        preferred = []
+        others = []
+        for link in links:
+            geo = extract_geo_from_link(link)
+            if geo == PREFERRED_COUNTRY:
+                preferred.append(link)
+            else:
+                others.append(link)
+
+        if preferred:
+            logger.info(f"⭐ Приоритет {PREFERRED_COUNTRY}: {len(preferred)} ссылок из {len(links)}")
+        else:
+            logger.warning(f"⚠️ Приоритет {PREFERRED_COUNTRY}: ссылок с этой страной нет, используем все")
+
+        return preferred + others
 
     def _find_working_primary(self) -> Optional[str]:
-        """Перебирает ссылки и возвращает первую живую для основной."""
+        """Перебирает ссылки и возвращает первую живую (с учётом приоритета)."""
         total = len(self.links)
+
+        # Сортируем по приоритету
+        sorted_links = self._sort_links_by_preferred(self.links)
+
         logger.info(f"🔍 Проверяем ссылки при старте (до первой живой, максимум {total})...")
 
-        for i, link in enumerate(self.links, 1):
+        for i, link in enumerate(sorted_links, 1):
             if _shutdown_requested.is_set():
                 return None
 
@@ -677,7 +277,8 @@ class VlessObserver:
             is_working, ping, _ = test_link_through_xray(
                 link,
                 PROXY_PORT_PRIMARY,
-                timeout=TEST_TIMEOUT
+                timeout=TEST_TIMEOUT,
+                shutdown_event=_shutdown_requested
             )
 
             if is_working:
@@ -691,22 +292,12 @@ class VlessObserver:
         return None
 
     def _get_candidates_from_file(self) -> List[str]:
-        """
-        Возвращает кандидатов на резерв из файла:
-        - не текущая основная
-        - не в backup_pool
-        - не в deferred
-        - не в dead_links
-        - не в карантине
-        - не в recently_primary (если кулдаун не истёк)
-        """
+        """Возвращает кандидатов на резерв из файла (с приоритетом)."""
         all_links = read_links_file(LINKS_FILE)
         if not all_links:
             return []
 
-        # Чистим устаревшие записи в recently_primary
         self._cleanup_recently_primary()
-
         quarantine = self.load_quarantine()
 
         with self.primary_lock:
@@ -722,7 +313,6 @@ class VlessObserver:
         with self.dead_links_lock:
             dead_set = set(self.dead_links)
 
-        # Снимок recently_primary
         with self.recently_primary_lock:
             recent_set = set(self.recently_primary.keys())
 
@@ -748,15 +338,11 @@ class VlessObserver:
             seen_bases.add(l_base)
             candidates.append(link)
 
-        return candidates
+        # Сортируем по приоритету
+        return self._sort_links_by_preferred(candidates)
 
     def _fill_backup_pool_checked(self):
-        """
-        Пополняет backup_pool ЖИВЫМИ ссылками.
-        Перебирает кандидатов по одному:
-        - живая → в пул
-        - мёртвая → в deferred, берём следующую
-        """
+        """Пополняет backup_pool ЖИВЫМИ ссылками."""
         with self.pool_lock:
             current_size = len(self.backup_pool)
         need = BACKUP_POOL_SIZE - current_size
@@ -805,7 +391,8 @@ class VlessObserver:
             is_working, ping, _ = test_link_through_xray(
                 link,
                 PROXY_PORT_BACKUP,
-                timeout=BACKUP_TEST_TIMEOUT
+                timeout=BACKUP_TEST_TIMEOUT,
+                shutdown_event=_shutdown_requested
             )
 
             if is_working:
@@ -876,7 +463,8 @@ class VlessObserver:
             is_working, ping, _ = test_link_through_xray(
                 link,
                 PROXY_PORT_BACKUP,
-                timeout=BACKUP_TEST_TIMEOUT
+                timeout=BACKUP_TEST_TIMEOUT,
+                shutdown_event=_shutdown_requested
             )
 
             if is_working:
@@ -968,10 +556,8 @@ class VlessObserver:
             switch_count = self.switch_count
             fail_count = self.primary_stats['fail_count']
 
-        # Формируем строку статуса
         state = f"OK | {primary_display}"
 
-        # Показываем отказы, только если они есть
         if fail_count > 0:
             state += f" | отказов: {fail_count}/{FAILURES_TO_SWITCH}"
 
@@ -1009,6 +595,16 @@ class VlessObserver:
         logger.info("⏹️ Поток 1 (основная) завершён")
 
     def test_primary(self):
+        # --- Триггеры (команды от бота) ---
+        try:
+            if check_and_handle(self):
+                return   # триггер обработан — обычный тест пропускаем
+        except Exception as e:
+            logger.error(f"❌ Ошибка обработки триггеров: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+        # --- Старые триггеры (совместимость) ---
         if self.check_deep_check_trigger():
             return
         if self.check_quarantine_trigger():
@@ -1019,13 +615,15 @@ class VlessObserver:
             self.log_status(force=True)
             return
 
+        # --- Обычная проверка ---
         with self.primary_lock:
             primary = self.primary
 
         is_working, ping, size = test_link_through_xray(
             primary,
             PROXY_PORT_PRIMARY,
-            timeout=TEST_TIMEOUT
+            timeout=TEST_TIMEOUT,
+            shutdown_event=_shutdown_requested
         )
 
         if is_working:
@@ -1100,7 +698,8 @@ class VlessObserver:
             is_working, ping, size = test_link_through_xray(
                 item['link'],
                 PROXY_PORT_BACKUP,
-                timeout=BACKUP_TEST_TIMEOUT
+                timeout=BACKUP_TEST_TIMEOUT,
+                shutdown_event=_shutdown_requested
             )
 
             display = f"{item['host']} [{item.get('country', 'N/A')}]"
@@ -1219,7 +818,8 @@ class VlessObserver:
                 is_working, ping, size = test_link_through_xray(
                     link,
                     PROXY_PORT_DEFERRED,
-                    timeout=DEFERRED_TEST_TIMEOUT
+                    timeout=DEFERRED_TEST_TIMEOUT,
+                    shutdown_event=_shutdown_requested
                 )
 
                 parsed = parse_vless_link(link)
@@ -1263,7 +863,6 @@ class VlessObserver:
                     logger.warning(f"❌ Отложенная ссылка {display} всё ещё мертва ({total_elapsed_min} мин в deferred)")
 
     def update_pool_from_file(self):
-        """Обновляет self.links из файла. Не трогает backup_pool."""
         current_time = time.time()
         if current_time - self.last_pool_update_time < POOL_UPDATE_INTERVAL:
             return
@@ -1278,7 +877,7 @@ class VlessObserver:
         self.last_pool_update_time = current_time
 
     # --------------------------------------------------------
-    # Триггеры
+    # Старые триггеры (совместимость)
     # --------------------------------------------------------
 
     def check_trigger_file(self) -> bool:
@@ -1328,7 +927,8 @@ class VlessObserver:
 
         logger.info(f"  Шаг 1: Google...")
         google_ok, google_ping, _ = test_link_through_xray(
-            primary, PROXY_PORT_PRIMARY, timeout=TEST_TIMEOUT
+            primary, PROXY_PORT_PRIMARY, timeout=TEST_TIMEOUT,
+            shutdown_event=_shutdown_requested
         )
         if google_ok:
             logger.info(f"  ✅ Google доступен ({google_ping:.0f}мс)")
@@ -1337,7 +937,8 @@ class VlessObserver:
 
         logger.info(f"  Шаг 2: Запрещённые ресурсы...")
         deep_ok, deep_ping, deep_host = test_link_deep(
-            primary, PROXY_PORT_PRIMARY, timeout=DEEP_CHECK_TIMEOUT
+            primary, PROXY_PORT_PRIMARY, timeout=DEEP_CHECK_TIMEOUT,
+            shutdown_event=_shutdown_requested
         )
         if deep_ok:
             logger.info(f"  ✅ Запрещённый доступен: {deep_host} ({deep_ping:.0f}мс)")
@@ -1390,7 +991,6 @@ class VlessObserver:
     # --------------------------------------------------------
 
     def switch_to_backup(self):
-        """Вызывается ТОЛЬКО из потока 1 (primary_loop)."""
         self.switching.set()
 
         try:
@@ -1458,8 +1058,6 @@ class VlessObserver:
 
                     self.critical_error_logged = False
 
-                    # C: Добавляем старую основную в recently_primary,
-                    # чтобы она 60 сек не возвращалась в резерв
                     if old_primary:
                         self._add_to_recently_primary(old_primary)
                         logger.info(f"⏸️ {old_display} в recently_primary на {RECENTLY_PRIMARY_COOLDOWN}с")
@@ -1486,6 +1084,9 @@ class VlessObserver:
         logger.info("="*50)
         logger.info("🚀 VLESS OBSERVER (multi-threaded)")
         logger.info("="*50)
+
+        # Чистим старые триггеры при старте
+        cleanup_triggers_on_startup()
 
         while True:
             if _shutdown_requested.is_set():
@@ -1518,6 +1119,13 @@ class VlessObserver:
         logger.info(f"Обновление пула: каждые {CHECK_INTERVAL_POOL_UPDATE}с")
         logger.info(f"Переключение: после {FAILURES_TO_SWITCH} отказов подряд")
         logger.info(f"Защита от круговорота: {RECENTLY_PRIMARY_COOLDOWN}с")
+
+        if PREFERRED_COUNTRY:
+            logger.info(f"⭐ Приоритетная страна: {PREFERRED_COUNTRY}")
+        else:
+            logger.info(f"Приоритетная страна: не задана")
+
+        logger.info(f"Триггеры: включены (TRIGGER_MAX_AGE={TRIGGER_MAX_AGE}с)")
         logger.info(f"Источник ссылок: {LINKS_FILE}")
         logger.info("="*50)
 
