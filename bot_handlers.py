@@ -17,9 +17,11 @@
 игнорируем молча.
 """
 
+import os
 import re
 import asyncio
 import logging
+from datetime import datetime
 
 from aiogram import Router, Bot
 from aiogram.filters import Command, CommandObject
@@ -35,9 +37,107 @@ logger = logging.getLogger(__name__)
 router = Router(name="vless_bot")
 
 # Глобальный лок: один запрос к observer'у за раз.
-# Если пользователь жмёт кнопки быстро — запросы выполнятся по очереди,
-# а не создадут очередь из триггеров в /tmp/.
 _observer_lock = asyncio.Lock()
+
+
+# ============================================================
+# ЛОКАЛЬНАЯ ИНФОРМАЦИЯ О ЧЕКЕРЕ
+# ============================================================
+
+# Путь к файлу, который наполняет vless_checker.py.
+# Бот его только читает — для отображения в /status.
+_CHECKER_FILE = "/root/vless_checker/working_links.txt"
+
+# Порог свежести файла (часы). Чекер запускается по cron 4 раза
+# в сутки (01:00, 07:00, 13:00, 19:00) — раз в 6 часов. Если файл
+# не обновлялся дольше порога — показываем ⚠️.
+_CHECKER_STALE_HOURS = 6
+
+
+def _humanize_age(seconds: float) -> str:
+    """
+    Превращает «сколько секунд назад» в человекочитаемую строку:
+    '5 сек', '12 мин', '3 ч 15 мин', '2 д 4 ч'.
+    """
+    if seconds < 0:
+        seconds = 0
+    seconds = int(seconds)
+
+    if seconds < 60:
+        return f"{seconds} сек"
+
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} мин"
+
+    hours = minutes // 60
+    rem_minutes = minutes % 60
+    if hours < 24:
+        if rem_minutes:
+            return f"{hours} ч {rem_minutes} мин"
+        return f"{hours} ч"
+
+    days = hours // 24
+    rem_hours = hours % 24
+    if rem_hours:
+        return f"{days} д {rem_hours} ч"
+    return f"{days} д"
+
+
+def _read_checker_info() -> dict:
+    """
+    Читает working_links.txt: количество ссылок и свежесть.
+
+    Возвращает dict:
+      {
+        "exists": bool,
+        "count": int | None,
+        "age_str": str | None,   # '2 ч 15 мин'
+        "fresh": bool | None,    # None если файла нет
+      }
+
+    Никогда не бросает исключение — при ошибке возвращает
+    безопасный результат.
+    """
+    path = _CHECKER_FILE
+
+    if not os.path.exists(path):
+        return {
+            "exists": False,
+            "count": None,
+            "age_str": None,
+            "fresh": None,
+        }
+
+    # Количество непустых строк
+    count = None
+    try:
+        c = 0
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                if line.strip():
+                    c += 1
+        count = c
+    except Exception as e:
+        logger.warning(f"Не удалось прочитать {path}: {e}")
+
+    # Свежесть по mtime
+    age_str = None
+    fresh = None
+    try:
+        mtime = os.path.getmtime(path)
+        age_seconds = datetime.now().timestamp() - mtime
+        age_str = _humanize_age(age_seconds)
+        fresh = age_seconds < _CHECKER_STALE_HOURS * 3600
+    except Exception as e:
+        logger.warning(f"Не удалось получить mtime {path}: {e}")
+
+    return {
+        "exists": True,
+        "count": count,
+        "age_str": age_str,
+        "fresh": fresh,
+    }
 
 
 # ============================================================
@@ -72,18 +172,6 @@ def _parse_args(command_object: CommandObject) -> str:
     return command_object.args.strip()
 
 
-async def _reply_long(message: Message, parts: list, **kwargs) -> None:
-    """Отправляет список частей сообщения (для format_links)."""
-    for part in parts:
-        await message.answer(part, parse_mode=cfg.PARSE_MODE, **kwargs)
-
-
-async def _send_long(bot: Bot, chat_id: int, parts: list, **kwargs) -> None:
-    """То же, но через bot.send_message (для callback-ответов)."""
-    for part in parts:
-        await bot.send_message(chat_id, part, parse_mode=cfg.PARSE_MODE, **kwargs)
-
-
 def _short_action_name(response: dict) -> str:
     """Человекочитаемое имя команды для сообщения об ошибке."""
     action = response.get("action", "?")
@@ -104,20 +192,33 @@ def _short_action_name(response: dict) -> str:
     return mapping.get(action, action)
 
 
+async def _send_status(message_or_bot, chat_id: int, response: dict, bot: Bot = None):
+    """
+    Универсальная отправка /status: подмешивает локальную инфу
+    о чекере и шлёт через нужный канал (message или bot).
+    """
+    checker = _read_checker_info()
+    text = fmt.format_status(response, checker=checker)
+    markup = kb.status_keyboard()
+
+    if bot is not None:
+        await bot.send_message(chat_id, text,
+                               parse_mode=cfg.PARSE_MODE,
+                               reply_markup=markup)
+    else:
+        await message_or_bot.answer(text,
+                                    parse_mode=cfg.PARSE_MODE,
+                                    reply_markup=markup)
+
+
 # ============================================================
 # ОБЩИЙ ОБРАБОТЧИК РЕЗУЛЬТАТА
 # ============================================================
 
-async def _handle_response(
-    message: Message,
-    response: dict,
-    action_label: str,
-):
+async def _handle_response(message: Message, response: dict):
     """
-    Универсальная обработка ответа observer'а:
-      - ok=True  → форматируем по типу action
-      - ok=False → показываем ошибку
-    Используется командами switch/geo/pick/ignore/unignore/reload.
+    Универсальная обработка ответа observer'а для команд
+    switch/geo/pick/ignore/unignore/reload.
     """
     if not response.get("ok"):
         await message.answer(
@@ -150,7 +251,7 @@ async def _handle_response(
         text = fmt.format_reload_result(response)
         markup = kb.status_keyboard()
     else:
-        text = f"✅ <b>{_short_action_name(response)}</b>\n\n<code>{response}</code>"
+        text = f"✅ <b>{_short_action_name(response)}</b>"
         markup = kb.status_keyboard()
 
     await message.answer(text, parse_mode=cfg.PARSE_MODE, reply_markup=markup)
@@ -205,11 +306,7 @@ async def cmd_status(message: Message):
         )
         return
 
-    await message.answer(
-        fmt.format_status(response),
-        parse_mode=cfg.PARSE_MODE,
-        reply_markup=kb.status_keyboard(),
-    )
+    await _send_status(message, message.chat.id, response)
 
 
 @router.message(Command("links"))
@@ -231,7 +328,6 @@ async def cmd_links(message: Message):
         return
 
     parts = fmt.format_links(response)
-    # Клавиатуру вешаем только на последнюю часть, чтобы не дублировать.
     for i, part in enumerate(parts):
         is_last = (i == len(parts) - 1)
         markup = kb.links_keyboard() if is_last else None
@@ -245,7 +341,6 @@ async def cmd_switch(message: Message):
 
     logger.info(f"/switch от chat_id={message.chat.id}")
 
-    # Предупреждаем: Xray рестартует, Telegram-связь может прерваться.
     warn_msg = await message.answer(
         fmt.format_switch_warning(),
         parse_mode=cfg.PARSE_MODE,
@@ -254,13 +349,12 @@ async def cmd_switch(message: Message):
     async with _observer_lock:
         response = await client.request_switch()
 
-    # Удаляем предупреждение — оно больше не нужно.
     try:
         await warn_msg.delete()
     except Exception:
         pass
 
-    await _handle_response(message, response, "Switch")
+    await _handle_response(message, response)
 
 
 @router.message(Command("reload"))
@@ -273,7 +367,7 @@ async def cmd_reload(message: Message):
     async with _observer_lock:
         response = await client.request_reload()
 
-    await _handle_response(message, response, "Reload")
+    await _handle_response(message, response)
 
 
 # ============================================================
@@ -314,7 +408,7 @@ async def cmd_geo(message: Message, command: CommandObject):
     except Exception:
         pass
 
-    await _handle_response(message, response, f"Geo {country}")
+    await _handle_response(message, response)
 
 
 @router.message(Command("pick"))
@@ -349,7 +443,7 @@ async def cmd_pick(message: Message, command: CommandObject):
     except Exception:
         pass
 
-    await _handle_response(message, response, f"Pick {arg}")
+    await _handle_response(message, response)
 
 
 @router.message(Command("ignore"))
@@ -374,7 +468,7 @@ async def cmd_ignore(message: Message, command: CommandObject):
     async with _observer_lock:
         response = await client.request_ignore(arg)
 
-    await _handle_response(message, response, f"Ignore {arg}")
+    await _handle_response(message, response)
 
 
 @router.message(Command("unignore"))
@@ -399,7 +493,7 @@ async def cmd_unignore(message: Message, command: CommandObject):
     async with _observer_lock:
         response = await client.request_unignore(arg)
 
-    await _handle_response(message, response, f"Unignore {arg}")
+    await _handle_response(message, response)
 
 
 # ============================================================
@@ -409,8 +503,6 @@ async def cmd_unignore(message: Message, command: CommandObject):
 @router.callback_query(lambda c: c.data and c.data.startswith("cmd:"))
 async def on_callback(callback: CallbackQuery, bot: Bot):
     if not _is_authorized_cb(callback):
-        # Отвечаем на callback, чтобы у клиента не висело "часики",
-        # но никакой логики не выполняем.
         await callback.answer()
         return
 
@@ -418,7 +510,6 @@ async def on_callback(callback: CallbackQuery, bot: Bot):
     chat_id = callback.message.chat.id
     logger.info(f"callback '{action}' от chat_id={chat_id}")
 
-    # Для долгих операций — сразу снимаем "часики" с кнопки.
     await callback.answer()
 
     if action == "help":
@@ -441,12 +532,7 @@ async def on_callback(callback: CallbackQuery, bot: Bot):
                 reply_markup=kb.error_keyboard(),
             )
             return
-        await bot.send_message(
-            chat_id,
-            fmt.format_status(response),
-            parse_mode=cfg.PARSE_MODE,
-            reply_markup=kb.status_keyboard(),
-        )
+        await _send_status(None, chat_id, response, bot=bot)
         return
 
     if action == "links":
@@ -516,7 +602,6 @@ async def on_callback(callback: CallbackQuery, bot: Bot):
         )
         return
 
-    # Неизвестный action — игнорируем.
     logger.warning(f"Неизвестный callback action: {action}")
 
 
@@ -528,12 +613,10 @@ async def on_callback(callback: CallbackQuery, bot: Bot):
 async def cmd_unknown(message: Message):
     """
     Ловит любую команду, которая не была обработана выше.
-    Отвечает только авторизованному пользователю.
     """
     if not _is_authorized(message):
         return
 
-    # Пропускаем команды, которые уже были обработаны (на всякий случай).
     known = {"start", "help", "status", "links", "switch", "reload",
              "geo", "pick", "ignore", "unignore"}
     text = message.text or ""
