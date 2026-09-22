@@ -36,7 +36,7 @@ MERGE_SCRIPT_PATH="/root/merge_config.py"
 
 # Файлы, которые обновляются как обычно (замена)
 CHECKER_FILES="vless_checker.py server_tester.py run_stage1.sh run_stage2.sh run_full_check.sh"
-OBSERVER_FILES="observer.py show_logs.sh run_observer.sh"
+OBSERVER_FILES="vless_common.py triggers.py observer.py show_logs.sh run_observer.sh"
 
 # Файлы-конфиги, которые обновляются через merge_config.py
 CHECKER_CONFIG_FILES="vless_check_config.py"
@@ -482,7 +482,6 @@ fi
 # ============================================================
 print_header "КОНФИГИ (умное слияние)"
 
-# Функция слияния одного конфига
 merge_one_config() {
     local dir="$1"
     local file="$2"
@@ -497,7 +496,6 @@ merge_one_config() {
         return
     fi
 
-    # Скачиваем новый конфиг во временный файл
     if ! download_file "$GITHUB_RAW/$file" "$tmp_new" "$file"; then
         print_warning "  ✗ $file: не удалось скачать новую версию — пропущен"
         rm -f "$tmp_new"
@@ -510,7 +508,6 @@ merge_one_config() {
         return
     fi
 
-    # Запускаем merge_config.py
     local merge_args=("$current_path" "$tmp_new" "$file")
     if [ "$MODE" = "auto" ]; then
         merge_args+=("--auto")
