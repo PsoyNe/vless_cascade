@@ -20,6 +20,7 @@ from vless_common import (
     validate_reality_params,
     read_links_file,
     test_link_through_xray,
+    test_link_double_check,
     test_link_deep,
     update_3xui_outbound,
     reload_xray,
@@ -104,6 +105,9 @@ def _normalize_preferred_country() -> str:
 
 
 PREFERRED_COUNTRY = _normalize_preferred_country()
+
+# Устойчивое чтение параметров двойной проверки
+BACKUP_CHECK_ATTEMPTS = getattr(sys.modules['observer_config'], 'BACKUP_CHECK_ATTEMPTS', 2)
 
 
 # ============================================================
@@ -247,7 +251,6 @@ class VlessObserver:
         """Перебирает ссылки и возвращает первую живую (с учётом приоритета)."""
         total = len(self.links)
 
-        # Сортируем по приоритету
         sorted_links = self._sort_links_by_preferred(self.links)
 
         logger.info(f"🔍 Проверяем ссылки при старте (до первой живой, максимум {total})...")
@@ -338,11 +341,10 @@ class VlessObserver:
             seen_bases.add(l_base)
             candidates.append(link)
 
-        # Сортируем по приоритету
         return self._sort_links_by_preferred(candidates)
 
     def _fill_backup_pool_checked(self):
-        """Пополняет backup_pool ЖИВЫМИ ссылками."""
+        """Пополняет backup_pool ЖИВЫМИ ссылками (с двойной проверкой)."""
         with self.pool_lock:
             current_size = len(self.backup_pool)
         need = BACKUP_POOL_SIZE - current_size
@@ -386,12 +388,12 @@ class VlessObserver:
                     self.dead_links.add(link)
                 continue
 
-            logger.info(f"🔎 Проверяем кандидата [{checked}]: {display}...")
+            logger.info(f"🔎 Проверяем кандидата [{checked}]: {display} "
+                        f"({BACKUP_CHECK_ATTEMPTS} проверок, интервал {BACKUP_CHECK_INTERVAL}с)...")
 
-            is_working, ping, _ = test_link_through_xray(
+            is_working, ping = test_link_double_check(
                 link,
                 PROXY_PORT_BACKUP,
-                timeout=BACKUP_TEST_TIMEOUT,
                 shutdown_event=_shutdown_requested
             )
 
@@ -408,7 +410,7 @@ class VlessObserver:
                 logger.info(f"✅ {display} живая — в резерв [{current_size + added}/{BACKUP_POOL_SIZE}] (пинг: {ping:.0f}мс)")
             else:
                 self._add_to_deferred(link)
-                logger.warning(f"❌ {display} мертва — в deferred")
+                logger.warning(f"❌ {display} не прошла {BACKUP_CHECK_ATTEMPTS} проверок — в deferred")
 
         if added > 0:
             logger.info(f"✅ Резерв пополнен: +{added} (проверено кандидатов: {checked})")
@@ -416,7 +418,7 @@ class VlessObserver:
             logger.warning(f"⚠️ Не удалось пополнить резерв (проверено кандидатов: {checked})")
 
     def _fill_backup_pool_startup(self):
-        """Пополняет backup_pool при СТАРТЕ."""
+        """Пополняет backup_pool при СТАРТЕ (с двойной проверкой)."""
         with self.pool_lock:
             current_size = len(self.backup_pool)
         need = BACKUP_POOL_SIZE - current_size
@@ -458,12 +460,12 @@ class VlessObserver:
                     self.dead_links.add(link)
                 continue
 
-            logger.info(f"🔎 Резерв [{added + 1}/{BACKUP_POOL_SIZE}] проверяем {display}...")
+            logger.info(f"🔎 Резерв [{added + 1}/{BACKUP_POOL_SIZE}] проверяем {display} "
+                        f"({BACKUP_CHECK_ATTEMPTS} проверок, интервал {BACKUP_CHECK_INTERVAL}с)...")
 
-            is_working, ping, _ = test_link_through_xray(
+            is_working, ping = test_link_double_check(
                 link,
                 PROXY_PORT_BACKUP,
-                timeout=BACKUP_TEST_TIMEOUT,
                 shutdown_event=_shutdown_requested
             )
 
@@ -480,7 +482,7 @@ class VlessObserver:
                 logger.info(f"✅ Резерв [{added}/{BACKUP_POOL_SIZE}] {display} (пинг: {ping:.0f}мс)")
             else:
                 self._add_to_deferred(link)
-                logger.warning(f"❌ Резерв {display} мертва — в deferred")
+                logger.warning(f"❌ Резерв {display} не прошла {BACKUP_CHECK_ATTEMPTS} проверок — в deferred")
 
         if added < BACKUP_POOL_SIZE:
             logger.warning(f"⚠️ Набрано только {added}/{BACKUP_POOL_SIZE} резервных. "
@@ -598,7 +600,7 @@ class VlessObserver:
         # --- Триггеры (команды от бота) ---
         try:
             if check_and_handle(self):
-                return   # триггер обработан — обычный тест пропускаем
+                return
         except Exception as e:
             logger.error(f"❌ Ошибка обработки триггеров: {e}")
             import traceback
@@ -1035,12 +1037,31 @@ class VlessObserver:
 
             backup = alive_backups[0]
             new_primary = backup['link']
+            new_display = format_host_with_geo(new_primary)
+
+            # ПРОВЕРКА ПЕРЕД ПЕРЕКЛЮЧЕНИЕМ: убедимся, что ссылка жива прямо сейчас
+            logger.info(f"🔎 Проверка перед переключением: {new_display}...")
+            is_working, ping, _ = test_link_through_xray(
+                new_primary,
+                PROXY_PORT_BACKUP,
+                timeout=BACKUP_TEST_TIMEOUT,
+                shutdown_event=_shutdown_requested
+            )
+
+            if not is_working:
+                logger.warning(f"⚠️ {new_display} мертва при проверке перед переключением — в deferred")
+                self._add_to_deferred(new_primary)
+                with self.pool_lock:
+                    self.backup_pool = [item for item in self.backup_pool if item['link'] != new_primary]
+                tried_links.add(new_primary)
+                continue
+
+            logger.info(f"✅ {new_display} жива (пинг: {ping:.0f}мс) — переключаемся")
 
             with self.primary_lock:
                 old_primary = self.primary
 
             old_display = format_host_with_geo(old_primary) if old_primary else 'NONE [N/A]'
-            new_display = format_host_with_geo(new_primary)
 
             logger.warning(f"⚠️ ПЕРЕКЛЮЧЕНИЕ: {old_display} → {new_display}")
 
@@ -1085,7 +1106,6 @@ class VlessObserver:
         logger.info("🚀 VLESS OBSERVER (multi-threaded)")
         logger.info("="*50)
 
-        # Чистим старые триггеры при старте
         cleanup_triggers_on_startup()
 
         while True:
@@ -1113,6 +1133,8 @@ class VlessObserver:
         logger.info(f"Порты: primary={PROXY_PORT_PRIMARY}, backup={PROXY_PORT_BACKUP}, deferred={PROXY_PORT_DEFERRED}")
         logger.info(f"Проверка основной: каждые {CHECK_INTERVAL_PRIMARY}с (timeout {TEST_TIMEOUT}с)")
         logger.info(f"Проверка резерва: каждые {CHECK_INTERVAL_BACKUP}с (timeout {BACKUP_TEST_TIMEOUT}с)")
+        logger.info(f"Двойная проверка резерва: {BACKUP_CHECK_ATTEMPTS} раз, интервал {BACKUP_CHECK_INTERVAL}с")
+        logger.info(f"Проверка перед переключением: включена")
         logger.info(f"Проверка deferred: каждые {CHECK_INTERVAL_DEFERRED}с")
         logger.info(f"Перепроверка отложенных: раз в {DEAD_LINK_RETRY_INTERVAL//60} минут")
         logger.info(f"Удаление отложенных: через {DEAD_LINK_DELETE_AFTER//60} минут")
