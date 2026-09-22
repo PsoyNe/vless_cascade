@@ -43,6 +43,19 @@ def _fmt_ts(ts: Optional[float]) -> str:
         return "N/A"
 
 
+def _fmt_ping(ping) -> Optional[int]:
+    """
+    Приводит ping к целому числу.
+    Возвращает None, если ping отсутствует или не число.
+    """
+    if ping is None:
+        return None
+    try:
+        return int(round(float(ping)))
+    except (ValueError, TypeError):
+        return None
+
+
 def _truncate(text: str, limit: int = None) -> str:
     """Режет текст по лимиту, добавляя '…'."""
     if limit is None:
@@ -69,7 +82,6 @@ def _split_message(text: str, limit: int = None) -> List[str]:
     current_len = 0
 
     for line in text.split("\n"):
-        # +1 на перевод строки
         line_len = len(line) + 1
         if current_len + line_len > limit and current:
             parts.append("\n".join(current))
@@ -138,10 +150,12 @@ def format_status(response: dict) -> str:
         for item in backup_hosts:
             host = _esc(item.get("host", "?"))
             country = _esc(item.get("country", "N/A"))
-            ping = item.get("ping", 0)
+            ping = _fmt_ping(item.get("ping"))
             alive = item.get("alive", False)
             mark = "✅" if alive else "❌"
-            lines.append(f"   {mark} <code>{host}</code> [{country}] — {ping} ms")
+
+            ping_str = f" — {ping} ms" if ping is not None else ""
+            lines.append(f"   {mark} <code>{host}</code> [{country}]{ping_str}")
     else:
         lines.append("   <i>резерв пуст</i>")
     lines.append("")
@@ -166,7 +180,7 @@ def _format_link_item(item: dict, mark: str = "") -> str:
     """Одна строка со ссылкой: mark <code>host</code> [CC] (ping ms)."""
     host = _esc(item.get("host", "?"))
     country = _esc(item.get("country", "N/A"))
-    ping = item.get("ping")
+    ping = _fmt_ping(item.get("ping"))
     alive = item.get("alive")
     prefix = f"{mark} " if mark else ""
 
@@ -237,10 +251,6 @@ def format_links(response: dict) -> List[str]:
     lines.append(f"💀 <b>Dead ({len(dead)}):</b>")
     if dead:
         for link in dead:
-            # link — целая vless-ссылка; для краткости показываем
-            # только host, если удастся распарсить. Здесь мы не
-            # парсим (это дело observer'а) — просто показываем
-            # обрезанный фрагмент.
             short = _esc(str(link)[:80])
             lines.append(f"   <code>{short}</code>")
     else:
@@ -270,9 +280,6 @@ def format_links(response: dict) -> List[str]:
 def format_switch_result(response: dict, action_label: str) -> str:
     """
     Форматирует результат переключения (switch / geo / pick).
-
-    action_label — человекочитаемое имя команды ("Switch",
-    "Переключение на страну DE", ...).
     """
     data = response.get("data") or {}
     old = _esc(data.get("old_primary", "N/A"))
