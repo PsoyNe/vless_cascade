@@ -28,6 +28,13 @@ from observer_config import (
     OUTBOUND_NAME, FILE_READ_RETRIES, FILE_READ_RETRY_DELAY,
 )
 
+# Устойчивое чтение параметров двойной проверки
+import observer_config as _cfg
+
+BACKUP_CHECK_ATTEMPTS = getattr(_cfg, 'BACKUP_CHECK_ATTEMPTS', 2)
+BACKUP_CHECK_INTERVAL = getattr(_cfg, 'BACKUP_CHECK_INTERVAL', 2)
+BACKUP_TEST_TIMEOUT = getattr(_cfg, 'BACKUP_TEST_TIMEOUT', 4)
+
 
 # ============================================================
 # ПАРСИНГ ССЫЛОК
@@ -329,6 +336,69 @@ def test_link_through_xray(link: str, proxy_port: int,
             shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception:
             pass
+
+
+def test_link_double_check(link: str, proxy_port: int,
+                            attempts: int = None,
+                            interval: float = None,
+                            timeout: int = None,
+                            shutdown_event=None) -> Tuple[bool, float]:
+    """
+    Проверяет ссылку НЕСКОЛЬКО раз с интервалом.
+
+    Используется перед добавлением в резерв — чтобы отсеять ссылки,
+    которые отвечают нестабильно (1 раз из N).
+
+    Возвращает:
+        (True, ping)  — ВСЕ проверки прошли успешно (ping от последней)
+        (False, 0)    — хотя бы одна проверка FAIL
+
+    Параметры:
+        attempts  — сколько раз проверять (по умолчанию из конфига)
+        interval  — пауза между проверками в секундах
+        timeout   — таймаут на каждую проверку
+    """
+    if attempts is None:
+        attempts = BACKUP_CHECK_ATTEMPTS
+    if interval is None:
+        interval = BACKUP_CHECK_INTERVAL
+    if timeout is None:
+        timeout = BACKUP_TEST_TIMEOUT
+
+    # Если нужна только одна проверка — просто вызываем test_link_through_xray
+    if attempts <= 1:
+        is_working, ping, _ = test_link_through_xray(
+            link, proxy_port, timeout=timeout, shutdown_event=shutdown_event
+        )
+        return (is_working, ping if is_working else 0)
+
+    last_ping = 0
+
+    for attempt in range(1, attempts + 1):
+        if shutdown_event is not None and shutdown_event.is_set():
+            return (False, 0)
+
+        is_working, ping, _ = test_link_through_xray(
+            link, proxy_port, timeout=timeout, shutdown_event=shutdown_event
+        )
+
+        if not is_working:
+            return (False, 0)
+
+        last_ping = ping
+
+        # Пауза перед следующей проверкой (кроме последней)
+        if attempt < attempts:
+            # Разбиваем сон на секунды, чтобы реагировать на shutdown
+            remaining = interval
+            while remaining > 0:
+                if shutdown_event is not None and shutdown_event.is_set():
+                    return (False, 0)
+                sleep_chunk = min(1.0, remaining)
+                time.sleep(sleep_chunk)
+                remaining -= sleep_chunk
+
+    return (True, last_ping)
 
 
 def test_link_deep(link: str, proxy_port: int,
