@@ -13,6 +13,8 @@
   - Ссылки/хосты оборачиваем в <code>...</code> — удобно копировать.
   - Эмодзи для визуальной читаемости.
   - Длинные сообщения режем по cfg.MAX_MESSAGE_LENGTH.
+  - Без отступов: всё по левому краю (в Telegram пропорциональный
+    шрифт, отступы выглядят плавающе).
 """
 
 import html
@@ -116,14 +118,37 @@ def format_error(response: dict) -> str:
 # /status
 # ============================================================
 
-def format_status(response: dict) -> str:
+def format_status(response: dict, checker: Optional[dict] = None) -> str:
     """
     Форматирует ответ на /status.
 
-    Ожидает data:
-      primary, primary_fail_count, primary_success_count,
-      backup_alive, backup_total, backup_hosts: [{host, country, ping, alive}],
-      deferred_count, dead_count, switch_count
+    Параметры:
+      response — ответ observer'а (JSON).
+        Ожидает data:
+          primary, primary_fail_count, primary_success_count,
+          backup_alive, backup_total,
+          backup_hosts: [{host, country, ping, alive}],
+          deferred_count, dead_count, switch_count
+      checker — локальная информация о working_links.txt
+        (см. bot_handlers._read_checker_info). Может быть None,
+        тогда блок чекера не выводится.
+
+    Формат (всё по левому краю, без отступов):
+      📡 Статус observer
+
+      🟢 Основная: <host> [CC]
+      ✅ Успехов: N   ❌ Отказов: N
+
+      🛡 Резерв: X/Y живых
+      ✅ <host> [CC] — N ms
+      ...
+
+      ⏳ Отложенные: N   💀 Мёртвые: N   🔄 Переключений: N
+
+      📄 Файл ссылок: N
+      🧠 Чекер: 🟢 обновлён 2 ч 15 мин назад
+
+      🕒 <время>
     """
     data = response.get("data") or {}
 
@@ -141,7 +166,7 @@ def format_status(response: dict) -> str:
 
     # Основная
     lines.append(f"🟢 <b>Основная:</b> <code>{primary}</code>")
-    lines.append(f"   ✅ Успехов: {success}   ❌ Отказов: {fail}")
+    lines.append(f"✅ Успехов: {success}   ❌ Отказов: {fail}")
     lines.append("")
 
     # Резерв
@@ -155,15 +180,21 @@ def format_status(response: dict) -> str:
             mark = "✅" if alive else "❌"
 
             ping_str = f" — {ping} ms" if ping is not None else ""
-            lines.append(f"   {mark} <code>{host}</code> [{country}]{ping_str}")
+            lines.append(f"{mark} <code>{host}</code> [{country}]{ping_str}")
     else:
-        lines.append("   <i>резерв пуст</i>")
+        lines.append("<i>резерв пуст</i>")
     lines.append("")
 
-    # Счётчики
+    # Счётчики (переведены)
     lines.append(
-        f"⏳ Deferred: {deferred}   💀 Dead: {dead}   🔄 Переключений: {switches}"
+        f"⏳ Отложенные: {deferred}   💀 Мёртвые: {dead}   "
+        f"🔄 Переключений: {switches}"
     )
+
+    # Локальная информация о чекере
+    if checker:
+        lines.append("")
+        lines.append(_format_checker_block(checker))
 
     # Время ответа
     lines.append("")
@@ -172,26 +203,55 @@ def format_status(response: dict) -> str:
     return _truncate("\n".join(lines))
 
 
+def _format_checker_block(checker: dict) -> str:
+    """
+    Форматирует блок про working_links.txt.
+    Ожидает dict от bot_handlers._read_checker_info:
+      {exists, count, age_str, fresh}
+    """
+    if not checker.get("exists"):
+        return (
+            "📄 <b>Файл ссылок:</b> —\n"
+            "🧠 <b>Чекер:</b> ⚠️ файл не найден"
+        )
+
+    count = checker.get("count")
+    count_str = str(count) if count is not None else "?"
+
+    age_str = checker.get("age_str") or "?"
+    fresh = checker.get("fresh")
+
+    if fresh is True:
+        status = f"🟢 обновлён {age_str} назад"
+    elif fresh is False:
+        status = f"⚠️ обновлён {age_str} назад"
+    else:
+        status = f"⚪ неизвестно ({age_str})"
+
+    return (
+        f"📄 <b>Файл ссылок:</b> {count_str}\n"
+        f"🧠 <b>Чекер:</b> {status}"
+    )
+
+
 # ============================================================
 # /links
 # ============================================================
 
-def _format_link_item(item: dict, mark: str = "") -> str:
-    """Одна строка со ссылкой: mark <code>host</code> [CC] (ping ms)."""
+def _format_link_item(item: dict) -> str:
+    """Одна строка со ссылкой: <mark> <code>host</code> [CC] — ping ms."""
     host = _esc(item.get("host", "?"))
     country = _esc(item.get("country", "N/A"))
     ping = _fmt_ping(item.get("ping"))
     alive = item.get("alive")
-    prefix = f"{mark} " if mark else ""
 
-    parts = [f"{prefix}<code>{host}</code> [{country}]"]
-
+    parts = [f"<code>{host}</code> [{country}]"]
     if ping is not None:
         parts.append(f"— {ping} ms")
     if alive is not None:
         parts.append("✅" if alive else "❌")
 
-    return "   " + " ".join(parts)
+    return " ".join(parts)
 
 
 def format_links(response: dict) -> List[str]:
@@ -199,8 +259,7 @@ def format_links(response: dict) -> List[str]:
     Форматирует ответ на /links.
 
     Возвращает СПИСОК строк — потому что при большом числе ссылок
-    одно сообщение может не влезть в лимит Telegram. handlers
-    отправит каждую часть отдельным сообщением.
+    одно сообщение может не влезть в лимит Telegram.
 
     Ожидает data:
       primary: {link, host, country} | None,
@@ -224,9 +283,9 @@ def format_links(response: dict) -> List[str]:
     if primary:
         host = _esc(primary.get("host", "?"))
         country = _esc(primary.get("country", "N/A"))
-        lines.append(f"   <code>{host}</code> [{country}]")
+        lines.append(f"<code>{host}</code> [{country}]")
     else:
-        lines.append("   <i>нет</i>")
+        lines.append("<i>нет</i>")
     lines.append("")
 
     # Резерв
@@ -235,26 +294,26 @@ def format_links(response: dict) -> List[str]:
         for item in backup:
             lines.append(_format_link_item(item))
     else:
-        lines.append("   <i>пусто</i>")
+        lines.append("<i>пусто</i>")
     lines.append("")
 
     # Deferred
-    lines.append(f"⏳ <b>Deferred ({len(deferred)}):</b>")
+    lines.append(f"⏳ <b>Отложенные ({len(deferred)}):</b>")
     if deferred:
         for item in deferred:
             lines.append(_format_link_item(item))
     else:
-        lines.append("   <i>пусто</i>")
+        lines.append("<i>пусто</i>")
     lines.append("")
 
     # Dead
-    lines.append(f"💀 <b>Dead ({len(dead)}):</b>")
+    lines.append(f"💀 <b>Мёртвые ({len(dead)}):</b>")
     if dead:
         for link in dead:
             short = _esc(str(link)[:80])
-            lines.append(f"   <code>{short}</code>")
+            lines.append(f"<code>{short}</code>")
     else:
-        lines.append("   <i>пусто</i>")
+        lines.append("<i>пусто</i>")
     lines.append("")
 
     # Карантин
@@ -263,7 +322,7 @@ def format_links(response: dict) -> List[str]:
         for item in quarantine:
             lines.append(_format_link_item(item))
     else:
-        lines.append("   <i>пусто</i>")
+        lines.append("<i>пусто</i>")
 
     # Время
     lines.append("")
