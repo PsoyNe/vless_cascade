@@ -17,7 +17,7 @@ LOG_OBSERVER="/var/log/vless_observer.log"
 LOG_CHECKER="/var/log/vless_checker.log"
 LOG_CRON="/var/log/vless_checker_cron.log"
 
-# Триггер-файлы
+# Триггер-файлы (старые)
 TRIGGER_SWITCH="/tmp/vless_observer_trigger"
 TRIGGER_QUARANTINE="/tmp/vless_quarantine_trigger"
 TRIGGER_DEEP_CHECK="/tmp/vless_deep_check_trigger"
@@ -27,12 +27,25 @@ VERSION_FILE_LOCAL="/root/.vless_cascade_version"
 UPDATE_SCRIPT="/root/update.sh"
 GITHUB_VERSION_URL="https://raw.githubusercontent.com/PsoyNe/vless_cascade/refs/heads/main/VERSION"
 
+# Конфиги
+CHECKER_CONFIG="/root/vless_checker/vless_check_config.py"
+OBSERVER_CONFIG="/root/vless_observer/observer_config.py"
+
+# Службы
+OBSERVER_SERVICE="vless_observer"
+
 print_header() {
     echo ""
     echo -e "${BLUE}============================================================${NC}"
     echo -e "${BLUE} $1${NC}"
     echo -e "${BLUE}============================================================${NC}"
     echo ""
+}
+
+pause() {
+    echo ""
+    read -p "Нажмите Enter для продолжения..." &
+    wait $!
 }
 
 show_menu() {
@@ -67,9 +80,17 @@ show_menu() {
     echo " 17) Обновить (с подтверждением)"
     echo " 18) Откатиться из последнего бэкапа"
     echo ""
+    echo -e "${CYAN}--- КОНФИГИ ---${NC}"
+    echo " 19) Просмотреть конфиг чекера"
+    echo " 20) Редактировать конфиг чекера"
+    echo " 21) Просмотреть конфиг обсервера"
+    echo " 22) Редактировать конфиг обсервера"
+    echo " 23) Проверить конфиги на ошибки"
+    echo " 24) Редактировать конфиг + перезапустить observer"
+    echo ""
     echo "  0) Выход"
     echo ""
-    read -p "Введите номер (0-18): " choice
+    read -p "Введите номер (0-24): " choice
 }
 
 show_observer() {
@@ -354,7 +375,6 @@ show_processes() {
 check_update() {
     print_header "ПРОВЕРКА ОБНОВЛЕНИЙ"
 
-    # Локальная версия
     local local_version="0.0.0"
     if [ -f "$VERSION_FILE_LOCAL" ]; then
         local_version=$(cat "$VERSION_FILE_LOCAL" | tr -d '[:space:]')
@@ -366,7 +386,6 @@ check_update() {
     echo -e "${CYAN}📊 Версии:${NC}"
     echo "  Установленная: $local_version"
 
-    # Удалённая версия
     local remote_version
     remote_version=$(wget -q --timeout=10 -O - "$GITHUB_VERSION_URL" 2>/dev/null | tr -d '[:space:]')
 
@@ -428,7 +447,6 @@ do_rollback() {
         return 1
     fi
 
-    # Показать список бэкапов
     echo -e "${CYAN}📁 Доступные бэкапы:${NC}"
     if ls -dt /root/vless_backup_* 2>/dev/null | head -5 | while read -r b; do
         echo "  $(basename "$b")"
@@ -461,6 +479,253 @@ do_rollback() {
 }
 
 # ============================================================
+# КОНФИГИ
+# ============================================================
+
+view_checker_config() {
+    print_header "КОНФИГ ЧЕКЕРА: vless_check_config.py"
+
+    if [ ! -f "$CHECKER_CONFIG" ]; then
+        echo -e "${RED}❌ Файл не найден: $CHECKER_CONFIG${NC}"
+        return 1
+    fi
+
+    echo -e "${CYAN}Путь:${NC} $CHECKER_CONFIG"
+    echo -e "${CYAN}Размер:${NC} $(stat -c%s "$CHECKER_CONFIG") байт"
+    echo -e "${CYAN}Изменён:${NC} $(stat -c%y "$CHECKER_CONFIG" | cut -d'.' -f1)"
+    echo ""
+    echo "────────────────────────────────────────────────────────────"
+
+    cat "$CHECKER_CONFIG"
+
+    echo ""
+    echo "────────────────────────────────────────────────────────────"
+}
+
+edit_checker_config() {
+    print_header "РЕДАКТИРОВАНИЕ КОНФИГА ЧЕКЕРА"
+
+    if [ ! -f "$CHECKER_CONFIG" ]; then
+        echo -e "${RED}❌ Файл не найден: $CHECKER_CONFIG${NC}"
+        return 1
+    fi
+
+    echo -e "${CYAN}Путь:${NC} $CHECKER_CONFIG"
+    echo ""
+
+    # Бэкап перед редактированием
+    local backup="${CHECKER_CONFIG}.backup.$(date +%Y%m%d_%H%M%S)"
+    cp "$CHECKER_CONFIG" "$backup"
+    echo -e "${YELLOW}📁 Бэкап: $backup${NC}"
+    echo ""
+
+    read -p "Открыть в nano? (y/n): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Отменено${NC}"
+        rm -f "$backup"
+        return 0
+    fi
+
+    nano "$CHECKER_CONFIG"
+
+    echo ""
+    echo -e "${CYAN}Проверка конфига...${NC}"
+    if python3 -c "import sys; sys.path.insert(0, '/root/vless_checker'); import vless_check_config" 2>/dev/null; then
+        echo -e "${GREEN}✅ Конфиг корректен${NC}"
+        echo ""
+        echo -e "${YELLOW}Настройки применятся при следующем запуске чекера${NC}"
+        echo -e "${YELLOW}(cron: 01:00, 07:00, 13:00, 19:00)${NC}"
+    else
+        echo -e "${RED}❌ Ошибка в конфиге!${NC}"
+        echo ""
+        echo -e "${YELLOW}Восстановить из бэкапа?${NC}"
+        read -p "(y/n): " restore
+        if [[ "$restore" =~ ^[Yy]$ ]]; then
+            cp "$backup" "$CHECKER_CONFIG"
+            echo -e "${GREEN}✅ Восстановлено из бэкапа${NC}"
+        else
+            echo -e "${YELLOW}Бэкап сохранён: $backup${NC}"
+        fi
+    fi
+}
+
+view_observer_config() {
+    print_header "КОНФИГ ОБСЕРВЕРА: observer_config.py"
+
+    if [ ! -f "$OBSERVER_CONFIG" ]; then
+        echo -e "${RED}❌ Файл не найден: $OBSERVER_CONFIG${NC}"
+        return 1
+    fi
+
+    echo -e "${CYAN}Путь:${NC} $OBSERVER_CONFIG"
+    echo -e "${CYAN}Размер:${NC} $(stat -c%s "$OBSERVER_CONFIG") байт"
+    echo -e "${CYAN}Изменён:${NC} $(stat -c%y "$OBSERVER_CONFIG" | cut -d'.' -f1)"
+    echo ""
+    echo "────────────────────────────────────────────────────────────"
+
+    cat "$OBSERVER_CONFIG"
+
+    echo ""
+    echo "────────────────────────────────────────────────────────────"
+}
+
+edit_observer_config() {
+    print_header "РЕДАКТИРОВАНИЕ КОНФИГА ОБСЕРВЕРА"
+
+    if [ ! -f "$OBSERVER_CONFIG" ]; then
+        echo -e "${RED}❌ Файл не найден: $OBSERVER_CONFIG${NC}"
+        return 1
+    fi
+
+    echo -e "${CYAN}Путь:${NC} $OBSERVER_CONFIG"
+    echo ""
+
+    # Бэкап перед редактированием
+    local backup="${OBSERVER_CONFIG}.backup.$(date +%Y%m%d_%H%M%S)"
+    cp "$OBSERVER_CONFIG" "$backup"
+    echo -e "${YELLOW}📁 Бэкап: $backup${NC}"
+    echo ""
+
+    read -p "Открыть в nano? (y/n): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Отменено${NC}"
+        rm -f "$backup"
+        return 0
+    fi
+
+    nano "$OBSERVER_CONFIG"
+
+    echo ""
+    echo -e "${CYAN}Проверка конфига...${NC}"
+    if python3 -c "import sys; sys.path.insert(0, '/root/vless_observer'); import observer_config" 2>/dev/null; then
+        echo -e "${GREEN}✅ Конфиг корректен${NC}"
+        echo ""
+        echo -e "${YELLOW}Перезапустить observer для применения? (y/n)${NC}"
+        read -p "(y/n): " restart
+        if [[ "$restart" =~ ^[Yy]$ ]]; then
+            systemctl restart vless_observer
+            sleep 2
+            if systemctl is-active --quiet vless_observer; then
+                echo -e "${GREEN}✅ Observer перезапущен${NC}"
+            else
+                echo -e "${RED}❌ Observer не запустился!${NC}"
+                echo -e "${YELLOW}Проверьте: journalctl -u vless_observer -n 50${NC}"
+                echo -e "${YELLOW}Откатить из бэкапа? (y/n)${NC}"
+                read -p "(y/n): " rollback
+                if [[ "$rollback" =~ ^[Yy]$ ]]; then
+                    cp "$backup" "$OBSERVER_CONFIG"
+                    systemctl restart vless_observer
+                    sleep 2
+                    if systemctl is-active --quiet vless_observer; then
+                        echo -e "${GREEN}✅ Откат выполнен, observer запущен${NC}"
+                    else
+                        echo -e "${RED}❌ Observer всё ещё не работает${NC}"
+                    fi
+                fi
+            fi
+        fi
+    else
+        echo -e "${RED}❌ Ошибка в конфиге!${NC}"
+        echo ""
+        echo -e "${YELLOW}Восстановить из бэкапа?${NC}"
+        read -p "(y/n): " restore
+        if [[ "$restore" =~ ^[Yy]$ ]]; then
+            cp "$backup" "$OBSERVER_CONFIG"
+            echo -e "${GREEN}✅ Восстановлено из бэкапа${NC}"
+        else
+            echo -e "${YELLOW}Бэкап сохранён: $backup${NC}"
+        fi
+    fi
+}
+
+check_configs() {
+    print_header "ПРОВЕРКА КОНФИГОВ"
+
+    echo -e "${CYAN}📊 Конфиг чекера:${NC}"
+    echo "  Путь: $CHECKER_CONFIG"
+    if [ -f "$CHECKER_CONFIG" ]; then
+        if python3 -c "import sys; sys.path.insert(0, '/root/vless_checker'); import vless_check_config" 2>/dev/null; then
+            echo -e "  ${GREEN}✅ Корректен${NC}"
+        else
+            echo -e "  ${RED}❌ Ошибка импорта${NC}"
+            echo ""
+            echo "  Проверить вручную:"
+            echo "    python3 -c \"import sys; sys.path.insert(0, '/root/vless_checker'); import vless_check_config\""
+        fi
+    else
+        echo -e "  ${RED}❌ Файл не найден${NC}"
+    fi
+    echo ""
+
+    echo -e "${CYAN}📊 Конфиг обсервера:${NC}"
+    echo "  Путь: $OBSERVER_CONFIG"
+    if [ -f "$OBSERVER_CONFIG" ]; then
+        if python3 -c "import sys; sys.path.insert(0, '/root/vless_observer'); import observer_config" 2>/dev/null; then
+            echo -e "  ${GREEN}✅ Корректен${NC}"
+        else
+            echo -e "  ${RED}❌ Ошибка импорта${NC}"
+            echo ""
+            echo "  Проверить вручную:"
+            echo "    python3 -c \"import sys; sys.path.insert(0, '/root/vless_observer'); import observer_config\""
+        fi
+    else
+        echo -e "  ${RED}❌ Файл не найден${NC}"
+    fi
+    echo ""
+
+    # Дополнительно — проверка зависимостей
+    echo -e "${CYAN}📊 Зависимости observer'а:${NC}"
+    for module in vless_common triggers; do
+        if python3 -c "import sys; sys.path.insert(0, '/root/vless_observer'); import $module" 2>/dev/null; then
+            echo -e "  ${GREEN}✅ $module.py${NC}"
+        else
+            echo -e "  ${RED}❌ $module.py — ошибка импорта${NC}"
+        fi
+    done
+    echo ""
+
+    # Статус службы
+    echo -e "${CYAN}📊 Служба observer:${NC}"
+    if systemctl is-active --quiet vless_observer; then
+        echo -e "  ${GREEN}✅ Активна${NC}"
+    else
+        echo -e "  ${RED}❌ Не активна${NC}"
+    fi
+}
+
+edit_and_restart() {
+    print_header "РЕДАКТИРОВАНИЕ + ПЕРЕЗАПУСК"
+
+    echo -e "${CYAN}Какой конфиг редактировать?${NC}"
+    echo "  1) vless_check_config.py (чекер)"
+    echo "  2) observer_config.py (обсервер)"
+    echo "  0) Отмена"
+    echo ""
+    read -p "Выбор: " cfg_choice
+
+    case $cfg_choice in
+        1)
+            view_checker_config
+            echo ""
+            read -p "Редактировать? (y/n): " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                edit_checker_config
+            fi
+            ;;
+        2)
+            view_observer_config
+            echo ""
+            read -p "Редактировать? (y/n): " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                edit_observer_config
+            fi
+            ;;
+        0) return 0 ;;
+        *) echo -e "${RED}Неверный выбор${NC}" ;;
+    esac
+}
+
+# ============================================================
 # ГЛАВНЫЙ ЦИКЛ
 # ============================================================
 while true; do
@@ -485,11 +750,15 @@ while true; do
         16) check_update ;;
         17) do_update ;;
         18) do_rollback ;;
+        19) view_checker_config ;;
+        20) edit_checker_config ;;
+        21) view_observer_config ;;
+        22) edit_observer_config ;;
+        23) check_configs ;;
+        24) edit_and_restart ;;
         0) echo -e "${GREEN}Выход${NC}"; exit 0 ;;
         *) echo -e "${RED}Неверный выбор${NC}" ;;
     esac
 
-    echo ""
-    read -p "Нажмите Enter для продолжения..." &
-    wait $!
+    pause
 done
