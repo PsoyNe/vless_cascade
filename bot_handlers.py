@@ -32,6 +32,13 @@ import bot_observer_client as client
 import bot_formatters as fmt
 import bot_keyboards as kb
 
+try:
+    import psutil
+    _PSUTIL_AVAILABLE = True
+except ImportError:
+    psutil = None
+    _PSUTIL_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 router = Router(name="vless_bot")
@@ -141,6 +148,62 @@ def _read_checker_info() -> dict:
 
 
 # ============================================================
+# СИСТЕМНАЯ ИНФОРМАЦИЯ (CPU)
+# ============================================================
+
+def _read_system_info() -> dict:
+    """
+    Собирает системную информацию: температуру CPU и загрузку CPU.
+
+    Возвращает dict:
+      {
+        "psutil": bool,            # доступен ли psutil
+        "cpu_temp": float | None,  # °C
+        "cpu_load": float | None,  # %
+      }
+
+    Никогда не бросает исключение.
+    """
+    if not _PSUTIL_AVAILABLE:
+        return {
+            "psutil": False,
+            "cpu_temp": None,
+            "cpu_load": None,
+        }
+
+    cpu_load = None
+    cpu_temp = None
+
+    # Загрузка CPU: блокирующий замер 0.5 сек для точности.
+    try:
+        cpu_load = psutil.cpu_percent(interval=0.5)
+    except Exception as e:
+        logger.warning(f"Не удалось получить загрузку CPU: {e}")
+
+    # Температура CPU: на Linux/ARM — sensors_temperatures().
+    # Ключи зависят от платформы: 'cpu_thermal', 'soc_thermal',
+    # 'coretemp' и т.п. Берём первый доступный сенсор.
+    try:
+        temps = psutil.sensors_temperatures()
+        if temps:
+            for name, entries in temps.items():
+                if entries:
+                    # entries — список namedtuple(shcurrent=..., ...)
+                    current = getattr(entries[0], 'current', None)
+                    if current is not None:
+                        cpu_temp = float(current)
+                        break
+    except Exception as e:
+        logger.warning(f"Не удалось получить температуру CPU: {e}")
+
+    return {
+        "psutil": True,
+        "cpu_temp": cpu_temp,
+        "cpu_load": cpu_load,
+    }
+
+
+# ============================================================
 # АВТОРИЗАЦИЯ
 # ============================================================
 
@@ -195,10 +258,11 @@ def _short_action_name(response: dict) -> str:
 async def _send_status(message_or_bot, chat_id: int, response: dict, bot: Bot = None):
     """
     Универсальная отправка /status: подмешивает локальную инфу
-    о чекере и шлёт через нужный канал (message или bot).
+    о чекере и системную инфу, шлёт через нужный канал.
     """
     checker = _read_checker_info()
-    text = fmt.format_status(response, checker=checker)
+    system = _read_system_info()
+    text = fmt.format_status(response, checker=checker, system=system)
     markup = kb.status_keyboard()
 
     if bot is not None:
@@ -611,9 +675,7 @@ async def on_callback(callback: CallbackQuery, bot: Bot):
 
 @router.message(Command(re.compile(r".*")))
 async def cmd_unknown(message: Message):
-    """
-    Ловит любую команду, которая не была обработана выше.
-    """
+    """Ловит любую команду, которая не была обработана выше."""
     if not _is_authorized(message):
         return
 
