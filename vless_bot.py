@@ -195,7 +195,8 @@ async def stats_loop(bot: Bot) -> None:
                 continue
 
             checker = bot_handlers._read_checker_info()
-            text = fmt.format_status(response, checker=checker)
+            system = bot_handlers._read_system_info()
+            text = fmt.format_status(response, checker=checker, system=system)
 
             await bot.send_message(
                 cfg.TELEGRAM_CHAT_ID,
