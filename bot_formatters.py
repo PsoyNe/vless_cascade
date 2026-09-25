@@ -154,7 +154,9 @@ def format_error(response: dict) -> str:
 # /status
 # ============================================================
 
-def format_status(response: dict, checker: Optional[dict] = None) -> str:
+def format_status(response: dict,
+                  checker: Optional[dict] = None,
+                  system: Optional[dict] = None) -> str:
     """
     Форматирует ответ на /status.
 
@@ -165,9 +167,10 @@ def format_status(response: dict, checker: Optional[dict] = None) -> str:
           backup_alive, backup_total,
           backup_hosts: [{host, country, ping, alive}],
           deferred_count, dead_count, switch_count
-      checker — локальная информация о working_links.txt
-        (см. bot_handlers._read_checker_info). Может быть None,
-        тогда блок чекера не выводится.
+      checker  — локальная информация о working_links.txt
+        (см. bot_handlers._read_checker_info). Может быть None.
+      system   — системная информация (CPU)
+        (см. bot_handlers._read_system_info). Может быть None.
 
     Всё по левому краю, без отступов.
     """
@@ -217,6 +220,12 @@ def format_status(response: dict, checker: Optional[dict] = None) -> str:
         lines.append("")
         lines.append(_format_checker_block(checker))
 
+    # Системная информация (CPU)
+    if system:
+        sys_lines = _format_system_block(system)
+        if sys_lines:
+            lines.append(sys_lines)
+
     # Время ответа
     lines.append("")
     lines.append(f"🕒 <i>{_fmt_ts(response.get('timestamp'))}</i>")
@@ -253,6 +262,41 @@ def _format_checker_block(checker: dict) -> str:
         f"📄 <b>Файл ссылок:</b> {count_str}\n"
         f"🧠 <b>Чекер:</b> {status}"
     )
+
+
+def _format_system_block(system: dict) -> str:
+    """
+    Форматирует блок с системной информацией.
+    Ожидает dict от bot_handlers._read_system_info:
+      {psutil, cpu_temp, cpu_load}
+    Возвращает пустую строку, если нечего показывать.
+    """
+    if not system:
+        return ""
+
+    psutil_ok = system.get("psutil", False)
+    cpu_temp = system.get("cpu_temp")
+    cpu_load = system.get("cpu_load")
+
+    # Если psutil нет и данных нет — ничего не показываем.
+    if not psutil_ok and cpu_temp is None and cpu_load is None:
+        return ""
+
+    parts = []
+
+    if cpu_temp is not None:
+        try:
+            parts.append(f"🌡 CPU: {int(round(float(cpu_temp)))}°C")
+        except (ValueError, TypeError):
+            pass
+
+    if cpu_load is not None:
+        try:
+            parts.append(f"⚡ Загрузка: {int(round(float(cpu_load)))}%")
+        except (ValueError, TypeError):
+            pass
+
+    return "   ".join(parts)
 
 
 # ============================================================
