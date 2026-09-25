@@ -98,6 +98,21 @@ def write_response(action: str, ok: bool,
         logger.error(f"❌ Не удалось записать ответ {response_path}: {e}")
 
 
+def _link_info(link: str) -> dict:
+    """
+    Формирует объект с информацией о ссылке:
+        {link, host, country}
+    """
+    parsed = parse_vless_link(link)
+    host = parsed['host'] if parsed else 'unknown'
+    country = extract_geo_from_link(link)
+    return {
+        'link': link,
+        'host': host,
+        'country': country,
+    }
+
+
 def cleanup_triggers_on_startup():
     """Удаляет все старые триггеры и ответы при старте observer."""
     count = 0
@@ -192,11 +207,22 @@ def handle_links(observer) -> None:
             for item in observer.backup_pool
         ]
 
+    current_time = time.time()
+
     with observer.deferred_lock:
-        deferred_keys = list(observer.deferred_links.keys())
+        deferred_items = []
+        for link, info in observer.deferred_links.items():
+            deferred_at = info.get('deferred_at', current_time)
+            deferred_min = int((current_time - deferred_at) / 60)
+            item = _link_info(link)
+            item['deferred_min'] = deferred_min
+            deferred_items.append(item)
 
     with observer.dead_links_lock:
-        dead_list = list(observer.dead_links)
+        dead_items = [
+            _link_info(link)
+            for link in observer.dead_links
+        ]
 
     quarantine = []
     try:
@@ -206,30 +232,15 @@ def handle_links(observer) -> None:
                 for line in f:
                     line = line.strip()
                     if line.startswith('vless://'):
-                        quarantine.append({
-                            'link': line,
-                            'host': format_host_with_geo(line).split('[')[0].strip(),
-                            'country': extract_geo_from_link(line),
-                        })
+                        quarantine.append(_link_info(line))
     except Exception as e:
         logger.warning(f"Не удалось прочитать карантин: {e}")
 
     data = {
-        'primary': {
-            'link': primary,
-            'host': format_host_with_geo(primary).split('[')[0].strip() if primary else 'N/A',
-            'country': extract_geo_from_link(primary) if primary else 'N/A',
-        } if primary else None,
+        'primary': _link_info(primary) if primary else None,
         'backup': backup_links,
-        'deferred': [
-            {
-                'link': link,
-                'host': format_host_with_geo(link).split('[')[0].strip(),
-                'country': extract_geo_from_link(link),
-            }
-            for link in deferred_keys
-        ],
-        'dead': dead_list,
+        'deferred': deferred_items,
+        'dead': dead_items,
         'quarantine': quarantine,
     }
 
@@ -574,10 +585,7 @@ def _process_simple_trigger(observer, path: str, action: str) -> bool:
 
 
 def _process_pattern_trigger(observer, path: str, prefix: str, handler) -> bool:
-    """
-    Обрабатывает триггер по шаблону (geo_XX, pick_HOST, ...).
-    True — был обработан.
-    """
+    """Обрабатывает триггер по шаблону (geo_XX, pick_HOST, ...)."""
     if path.endswith("_response"):
         return False
 
@@ -616,7 +624,6 @@ def check_and_handle(observer) -> bool:
         True  — триггер был обработан
         False — триггеров нет
     """
-    # Простые триггеры
     simple = [
         ("/tmp/vless_status_trigger", "status"),
         ("/tmp/vless_links_trigger", "links"),
@@ -628,7 +635,6 @@ def check_and_handle(observer) -> bool:
             if _process_simple_trigger(observer, path, action):
                 return True
 
-    # Триггеры по шаблону
     for path in glob.glob("/tmp/vless_geo_*"):
         if _process_pattern_trigger(observer, path, "/tmp/vless_geo_", handle_geo):
             return True
