@@ -10,7 +10,8 @@
 Соглашение:
   - Любые пользовательские данные (host, country, error) экранируются
     через html.escape(), чтобы не сломать разметку.
-  - Ссылки/хосты оборачиваем в <code>...</code> — удобно копировать.
+  - Хосты оборачиваем в <code>...</code> — удобно копировать.
+  - Без отступов: всё по левому краю. Галочки/крестики — слева.
   - Эмодзи для визуальной читаемости.
   - Длинные сообщения режем по cfg.MAX_MESSAGE_LENGTH.
 """
@@ -167,6 +168,8 @@ def format_status(response: dict, checker: Optional[dict] = None) -> str:
       checker — локальная информация о working_links.txt
         (см. bot_handlers._read_checker_info). Может быть None,
         тогда блок чекера не выводится.
+
+    Всё по левому краю, без отступов.
     """
     data = response.get("data") or {}
 
@@ -184,10 +187,10 @@ def format_status(response: dict, checker: Optional[dict] = None) -> str:
 
     # Основная
     lines.append(f"🟢 <b>Основная:</b> <code>{primary}</code>")
-    lines.append(f"   ✅ Успехов: {success}   ❌ Отказов: {fail}")
+    lines.append(f"✅ Успехов: {success}   ❌ Отказов: {fail}")
     lines.append("")
 
-    # Резерв
+    # Резерв — без отступов, галочки слева
     lines.append(f"🛡 <b>Резерв:</b> {backup_alive}/{backup_total} живых")
     if backup_hosts:
         for item in backup_hosts:
@@ -198,12 +201,12 @@ def format_status(response: dict, checker: Optional[dict] = None) -> str:
             mark = "✅" if alive else "❌"
 
             ping_str = f" — {ping} ms" if ping is not None else ""
-            lines.append(f"   {mark} <code>{host}</code> [{country}]{ping_str}")
+            lines.append(f"{mark} <code>{host}</code> [{country}]{ping_str}")
     else:
-        lines.append("   <i>резерв пуст</i>")
+        lines.append("<i>резерв пуст</i>")
     lines.append("")
 
-    # Счётчики (переведены)
+    # Счётчики
     lines.append(
         f"⏳ Отложенные: {deferred}   💀 Мёртвые: {dead}   "
         f"🔄 Переключений: {switches}"
@@ -256,37 +259,37 @@ def _format_checker_block(checker: dict) -> str:
 # /links
 # ============================================================
 
-def _format_link_item(item: dict, extra: Optional[str] = None) -> str:
+def _fmt_backup_line(item: dict) -> str:
     """
-    Одна строка со ссылкой.
-
-    Формат:
-        <code>host</code> [CC] — N ms ✅/❌ [extra]
-
-    Параметры:
-      item  — {host, country, ping?, alive?}
-      extra — необязательный текст в конец строки (для deferred:
-              '— N мин'). Добавляется перед галочкой/крестиком,
-              если они есть, иначе в самый конец.
+    Строка для резерва: галочка слева, ping, без отступа.
+        ✅ <code>host</code> [CC] — N ms
     """
     host = _esc(item.get("host", "?"))
     country = _esc(item.get("country", "N/A"))
     ping = _fmt_ping(item.get("ping"))
-    alive = item.get("alive")
+    alive = item.get("alive", False)
+    mark = "✅" if alive else "❌"
 
-    # Основная часть
-    parts = [f"<code>{host}</code> [{country}]"]
+    ping_str = f" — {ping} ms" if ping is not None else ""
+    return f"{mark} <code>{host}</code> [{country}]{ping_str}"
 
-    if ping is not None:
-        parts.append(f"— {ping} ms")
 
+def _fmt_plain_line(item: dict, extra: Optional[str] = None) -> str:
+    """
+    Строка без галочки и без ping (deferred / dead / quarantine):
+        <code>host</code> [CC] [— extra]
+
+    Параметры:
+      item  — {host, country}
+      extra — необязательный текст в конец (для deferred: '— N мин')
+    """
+    host = _esc(item.get("host", "?"))
+    country = _esc(item.get("country", "N/A"))
+
+    line = f"<code>{host}</code> [{country}]"
     if extra:
-        parts.append(extra)
-
-    if alive is not None:
-        parts.append("✅" if alive else "❌")
-
-    return " ".join(parts)
+        line += f" {extra}"
+    return line
 
 
 def format_links(response: dict) -> List[str]:
@@ -295,6 +298,8 @@ def format_links(response: dict) -> List[str]:
 
     Возвращает СПИСОК строк — потому что при большом числе ссылок
     одно сообщение может не влезть в лимит Telegram.
+
+    Всё по левому краю, без отступов. Галочка — только у резерва.
 
     Ожидает data (формат observer >= 1.0.8):
       primary:    {link, host, country} | None,
@@ -323,32 +328,31 @@ def format_links(response: dict) -> List[str]:
         lines.append("<i>нет</i>")
     lines.append("")
 
-    # Резерв
+    # Резерв — галочки слева, ping
     lines.append(f"🛡 <b>Резерв ({len(backup)}):</b>")
     if backup:
         for item in backup:
-            lines.append(_format_link_item(item))
+            lines.append(_fmt_backup_line(item))
     else:
         lines.append("<i>пусто</i>")
     lines.append("")
 
-    # Deferred — с временем отложенности
+    # Deferred — с временем
     lines.append(f"⏳ <b>Отложенные ({len(deferred)}):</b>")
     if deferred:
         for item in deferred:
-            deferred_min = item.get("deferred_min")
-            time_str = _fmt_deferred_time(deferred_min)
+            time_str = _fmt_deferred_time(item.get("deferred_min"))
             extra = f"— {time_str}" if time_str else None
-            lines.append(_format_link_item(item, extra=extra))
+            lines.append(_fmt_plain_line(item, extra=extra))
     else:
         lines.append("<i>пусто</i>")
     lines.append("")
 
-    # Dead — теперь список объектов, приводим к общему виду
+    # Dead
     lines.append(f"💀 <b>Мёртвые ({len(dead)}):</b>")
     if dead:
         for item in dead:
-            lines.append(_format_link_item(item))
+            lines.append(_fmt_plain_line(item))
     else:
         lines.append("<i>пусто</i>")
     lines.append("")
@@ -357,7 +361,7 @@ def format_links(response: dict) -> List[str]:
     lines.append(f"🚫 <b>Карантин ({len(quarantine)}):</b>")
     if quarantine:
         for item in quarantine:
-            lines.append(_format_link_item(item))
+            lines.append(_fmt_plain_line(item))
     else:
         lines.append("<i>пусто</i>")
 
@@ -374,9 +378,7 @@ def format_links(response: dict) -> List[str]:
 # ============================================================
 
 def format_switch_result(response: dict, action_label: str) -> str:
-    """
-    Форматирует результат переключения (switch / geo / pick).
-    """
+    """Форматирует результат переключения (switch / geo / pick)."""
     data = response.get("data") or {}
     old = _esc(data.get("old_primary", "N/A"))
     new = _esc(data.get("new_primary", "N/A"))
