@@ -16,7 +16,7 @@
 #   4. Качает файлы бота с GitHub.
 #   5. Спрашивает токен бота и chat_id.
 #   6. Подставляет их в vless_bot_config.py.
-#   7. Создаёт venv, ставит aiogram, aiohttp-socks.
+#   7. Создаёт venv, ставит aiogram, aiohttp-socks, psutil.
 #   8. Создаёт /etc/systemd/system/vless_bot.service.
 #   9. Запускает и включает службу.
 #
@@ -139,13 +139,10 @@ ok "Создано: ${BOT_DIR}"
 # -------------------- СКАЧИВАНИЕ ФАЙЛОВ --------------------
 log "Качаю файлы бота с GitHub (${GITHUB_BASE})..."
 
-# Функция скачивания одного файла с проверкой.
 download_file() {
     local filename="$1"
     local url="${GITHUB_BASE}/${filename}"
     local dest="${BOT_DIR}/${filename}"
-
-    # Качаем во временный файл, чтобы не оставить битый на месте рабочего.
     local tmp="${dest}.tmp"
 
     if [[ "${DOWNLOADER}" == "curl" ]]; then
@@ -162,14 +159,12 @@ download_file() {
         fi
     fi
 
-    # Проверяем, что файл не пустой и не HTML (страница ошибки).
     if [[ ! -s "${tmp}" ]]; then
         err "Скачался пустой файл: ${filename}"
         rm -f "${tmp}"
         return 1
     fi
 
-    # Первые байты: если это HTML ("<!DOCTYPE" или "<html") — что-то не так.
     local head_bytes
     head_bytes="$(head -c 100 "${tmp}" | tr -d '\n\r' | tr '[:upper:]' '[:lower:]')"
     if [[ "${head_bytes}" == "<!doctype"* ]] || [[ "${head_bytes}" == "<html"* ]]; then
@@ -232,12 +227,12 @@ if [[ ! -d "${VENV_DIR}" ]]; then
 fi
 ok "venv: ${VENV_DIR}"
 
-log "Обновляю pip и ставлю зависимости (aiogram, aiohttp-socks)..."
+log "Обновляю pip и ставлю зависимости (aiogram, aiohttp-socks, psutil)..."
 "${VENV_DIR}/bin/pip" install --upgrade pip >/dev/null
-"${VENV_DIR}/bin/pip" install --upgrade "aiogram>=3.0,<4.0" "aiohttp-socks>=0.8" >/dev/null
+"${VENV_DIR}/bin/pip" install --upgrade "aiogram>=3.0,<4.0" "aiohttp-socks>=0.8" "psutil>=5.9" >/dev/null
 ok "Зависимости установлены."
 
-"${VENV_DIR}/bin/pip" show aiogram aiohttp-socks | grep -E '^(Name|Version):'
+"${VENV_DIR}/bin/pip" show aiogram aiohttp-socks psutil | grep -E '^(Name|Version):'
 
 # -------------------- ЛОГ-ФАЙЛ --------------------
 log "Готовлю лог-файл ${LOG_FILE}..."
@@ -261,8 +256,6 @@ WorkingDirectory=${BOT_DIR}
 ExecStart=${VENV_DIR}/bin/python ${BOT_DIR}/vless_bot.py
 Restart=on-failure
 RestartSec=10
-StandardOutput=append:${LOG_FILE}
-StandardError=append:${LOG_FILE}
 TimeoutStopSec=15
 
 [Install]
