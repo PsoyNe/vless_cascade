@@ -11,14 +11,16 @@
 #
 # Что делает:
 #   1. Проверяет root.
-#   2. Проверяет наличие curl/wget.
-#   3. Создаёт /root/vless_bot/.
-#   4. Качает файлы бота с GitHub.
-#   5. Спрашивает токен бота и chat_id.
-#   6. Подставляет их в vless_bot_config.py.
-#   7. Создаёт venv, ставит aiogram, aiohttp-socks, psutil.
-#   8. Создаёт /etc/systemd/system/vless_bot.service.
-#   9. Запускает и включает службу.
+#   2. Определяет, чем качать (curl/wget).
+#   3. Ставит системные пакеты (gcc, python3-dev, python3-venv,
+#      python3-pip) — нужны для сборки psutil на 32-битных ARM.
+#   4. Создаёт /root/vless_bot/.
+#   5. Качает файлы бота с GitHub.
+#   6. Спрашивает токен бота и chat_id.
+#   7. Подставляет их в vless_bot_config.py.
+#   8. Создаёт venv, ставит aiogram, aiohttp-socks, psutil.
+#   9. Создаёт /etc/systemd/system/vless_bot.service.
+#  10. Запускает и включает службу.
 #
 # Запуск:
 #   bash install_bot.sh
@@ -60,13 +62,13 @@ BOT_FILES=(
     "bot_keyboards.py"
 )
 
-# -------------------- ПРОВЕРКИ --------------------
+# -------------------- ПРОВЕРКА ROOT --------------------
 if [[ $EUID -ne 0 ]]; then
     err "Скрипт надо запускать от root (sudo bash install_bot.sh)"
     exit 1
 fi
 
-# Определяем, чем качать. Предпочитаем curl, fallback — wget.
+# -------------------- ОПРЕДЕЛЯЕМ DOWNLOADER --------------------
 DOWNLOADER=""
 if command -v curl >/dev/null 2>&1; then
     DOWNLOADER="curl"
@@ -77,6 +79,35 @@ else
     exit 1
 fi
 log "Скачивание через: ${DOWNLOADER}"
+
+# -------------------- СИСТЕМНЫЕ ЗАВИСИМОСТИ --------------------
+# psutil на 32-битных ARM (armv7l) собирается из исходников —
+# для этого нужны gcc и python3-dev. На чистых Debian/Ubuntu
+# (и на Armbian) их обычно нет.
+if command -v apt-get >/dev/null 2>&1; then
+    log "Проверяю системные пакеты (gcc, python3-dev, python3-venv, python3-pip)..."
+
+    MISSING_PKGS=()
+    for pkg in gcc python3-dev python3-venv python3-pip; do
+        if ! dpkg -s "${pkg}" >/dev/null 2>&1; then
+            MISSING_PKGS+=("${pkg}")
+        fi
+    done
+
+    if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
+        log "Ставлю отсутствующие пакеты: ${MISSING_PKGS[*]}"
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get install -y -qq "${MISSING_PKGS[@]}"
+        ok "Системные пакеты установлены."
+    else
+        ok "Все системные пакеты уже есть."
+    fi
+else
+    warn "apt-get не найден (не Debian/Ubuntu?)."
+    warn "Убедись, что установлены: gcc, python3-dev, python3-venv, python3-pip."
+    warn "Без них psutil (нужен для CPU-инфо) не соберётся."
+fi
 
 # -------------------- ПРОВЕРКА PYTHON --------------------
 log "Проверяю Python 3..."
