@@ -10,7 +10,8 @@ VLESS Bot — точка входа.
   3. Retry-цикл подключения к Telegram: observer может ещё не
      успеть поднять Xray / primary-ссылку, ждём.
   4. set_my_commands — меню команд по кнопке "/" в Telegram.
-  5. Регистрация роутера и запуск long-polling.
+  5. Фоновая задача авто-выгрузки статистики (раз в N минут).
+  6. Регистрация роутера и запуск long-polling.
 
 Никакой логики команд здесь нет — всё в bot_handlers.py.
 """
@@ -26,6 +27,10 @@ from aiogram.exceptions import TelegramNetworkError
 from aiogram.types import BotCommand
 
 import vless_bot_config as cfg
+import bot_observer_client as client
+import bot_formatters as fmt
+import bot_keyboards as kb
+import bot_handlers
 from bot_handlers import router
 
 
@@ -40,7 +45,6 @@ def setup_logging() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # Файловый хендлер с ротацией
     file_handler = TimedRotatingFileHandler(
         cfg.LOG_FILE,
         when=cfg.LOG_ROTATION_WHEN,
@@ -51,7 +55,6 @@ def setup_logging() -> None:
     file_handler.setFormatter(formatter)
     file_handler.setLevel(logging.INFO)
 
-    # Консольный хендлер — для systemd journal
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     console_handler.setLevel(logging.INFO)
@@ -61,7 +64,6 @@ def setup_logging() -> None:
     root.addHandler(file_handler)
     root.addHandler(console_handler)
 
-    # Чуть приглушаем слишком болтливые логгеры aiogram/aiohttp
     logging.getLogger("aiogram").setLevel(logging.INFO)
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
 
@@ -77,17 +79,10 @@ def build_bot() -> Bot:
     """
     Создаёт Bot с AiohttpSession, настроенной на SOCKS5-прокси
     (127.0.0.1:1080).
-
-    aiogram v3 умеет прокси через AiohttpSession(proxy=...),
-    если установлен aiohttp-socks. Схема socks5:// и http://
-    определяются по URL автоматически.
-
-    Таймауты: ставим умеренные — при рестарте Xray связь пропадает
-    на пару секунд, aiogram должен пережить это без падения.
     """
     session = AiohttpSession(
         proxy=cfg.TELEGRAM_PROXY,
-        timeout=30,  # общий таймаут на запрос, сек
+        timeout=30,
     )
     bot = Bot(token=cfg.TELEGRAM_BOT_TOKEN, session=session)
     return bot
@@ -98,10 +93,7 @@ def build_bot() -> Bot:
 # ============================================================
 
 async def setup_commands(bot: Bot) -> None:
-    """
-    Регистрирует меню команд (кнопка "/" в Telegram).
-    Вызывается после успешного подключения.
-    """
+    """Регистрирует меню команд (кнопка "/" в Telegram)."""
     commands = [
         BotCommand(command="status",    description="📡 Статус observer"),
         BotCommand(command="links",     description="🔗 Список всех ссылок"),
@@ -167,6 +159,61 @@ async def wait_for_telegram(bot: Bot) -> None:
 
 
 # ============================================================
+# АВТО-ВЫГРУЗКА СТАТИСТИКИ
+# ============================================================
+
+async def stats_loop(bot: Bot) -> None:
+    """
+    Фоновая задача: раз в STATS_INTERVAL_MINUTES минут отправляет
+    /status в Telegram.
+
+    Особенности:
+      - Использует тот же _observer_lock, что и handlers, чтобы
+        авто-запрос не пересекался с командой пользователя.
+      - Первая отправка — через полный интервал после старта
+        (не сразу), чтобы не спамить при рестартах службы.
+      - При ошибке — логируем и ждём следующий цикл.
+    """
+    interval_sec = cfg.STATS_INTERVAL_MINUTES * 60
+    logger.info(
+        f"📊 Авто-статус: включён, раз в {cfg.STATS_INTERVAL_MINUTES} мин "
+        f"(первая отправка через {cfg.STATS_INTERVAL_MINUTES} мин)"
+    )
+
+    while True:
+        await asyncio.sleep(interval_sec)
+
+        try:
+            async with bot_handlers._observer_lock:
+                response = await client.request_status()
+
+            if not response.get("ok"):
+                logger.warning(
+                    f"📊 Авто-статус: observer вернул ошибку: "
+                    f"{response.get('error')}"
+                )
+                continue
+
+            checker = bot_handlers._read_checker_info()
+            text = fmt.format_status(response, checker=checker)
+
+            await bot.send_message(
+                cfg.TELEGRAM_CHAT_ID,
+                text,
+                parse_mode=cfg.PARSE_MODE,
+                reply_markup=kb.status_keyboard(),
+            )
+            logger.info("📤 Авто-статус отправлен")
+
+        except Exception as e:
+            logger.error(
+                f"📊 Авто-статус: ошибка отправки: "
+                f"{type(e).__name__}: {e}"
+            )
+            # Не падаем — ждём следующий цикл.
+
+
+# ============================================================
 # ЗАПУСК
 # ============================================================
 
@@ -191,15 +238,25 @@ async def main_async() -> None:
         await setup_commands(bot)
     except Exception as e:
         logger.error(f"Не удалось зарегистрировать меню команд: {e}")
-        # Не критично — продолжаем без меню.
 
-    # 3. Запускаем polling.
-    #    drop_pending_updates=True — на случай, если бот был выключен
-    #    и в Telegram накопились старые апдейты: не обрабатываем их.
+    # 3. Запускаем фоновую задачу авто-статуса (если включена)
+    stats_task = None
+    if cfg.STATS_INTERVAL_MINUTES > 0:
+        stats_task = asyncio.create_task(stats_loop(bot))
+    else:
+        logger.info("📊 Авто-статус: выключен (STATS_INTERVAL_MINUTES = 0)")
+
+    # 4. Запускаем polling
     try:
         logger.info("📡 Запуск polling...")
         await dp.start_polling(bot, drop_pending_updates=True)
     finally:
+        if stats_task is not None:
+            stats_task.cancel()
+            try:
+                await stats_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await bot.session.close()
         logger.info("🛑 Бот остановлен")
 
@@ -208,7 +265,6 @@ def main() -> None:
     """Синхронная точка входа."""
     setup_logging()
 
-    # Проверка конфига — базовая
     if not cfg.TELEGRAM_BOT_TOKEN or cfg.TELEGRAM_BOT_TOKEN.startswith("PASTE_"):
         logger.error(
             "❌ TELEGRAM_BOT_TOKEN не задан. "
