@@ -87,10 +87,7 @@ signal.signal(signal.SIGINT, _handle_sigterm)
 # ============================================================
 
 def _normalize_preferred_country() -> str:
-    """
-    Возвращает валидный код приоритетной страны или '' (нет приоритета).
-    Невалидный код игнорируется с предупреждением в лог.
-    """
+    """Возвращает валидный код приоритетной страны или '' (нет приоритета)."""
     raw = getattr(__import__('observer_config'), 'PREFERRED_COUNTRY', '')
     if not raw:
         return ''
@@ -106,8 +103,10 @@ def _normalize_preferred_country() -> str:
 
 PREFERRED_COUNTRY = _normalize_preferred_country()
 
-# Устойчивое чтение параметров двойной проверки
-BACKUP_CHECK_ATTEMPTS = getattr(sys.modules['observer_config'], 'BACKUP_CHECK_ATTEMPTS', 2)
+# Устойчивое чтение параметров
+import observer_config as _cfg
+
+BACKUP_CHECK_ATTEMPTS = getattr(_cfg, 'BACKUP_CHECK_ATTEMPTS', 2)
 
 
 # ============================================================
@@ -224,10 +223,6 @@ class VlessObserver:
                 del self.recently_primary[link]
 
     def _sort_links_by_preferred(self, links: List[str]) -> List[str]:
-        """
-        Сортирует ссылки так, чтобы ссылки с PREFERRED_COUNTRY шли первыми.
-        Если PREFERRED_COUNTRY пуст — возвращает как есть.
-        """
         if not PREFERRED_COUNTRY:
             return links
 
@@ -248,9 +243,7 @@ class VlessObserver:
         return preferred + others
 
     def _find_working_primary(self) -> Optional[str]:
-        """Перебирает ссылки и возвращает первую живую (с учётом приоритета)."""
         total = len(self.links)
-
         sorted_links = self._sort_links_by_preferred(self.links)
 
         logger.info(f"🔍 Проверяем ссылки при старте (до первой живой, максимум {total})...")
@@ -295,7 +288,6 @@ class VlessObserver:
         return None
 
     def _get_candidates_from_file(self) -> List[str]:
-        """Возвращает кандидатов на резерв из файла (с приоритетом)."""
         all_links = read_links_file(LINKS_FILE)
         if not all_links:
             return []
@@ -344,7 +336,6 @@ class VlessObserver:
         return self._sort_links_by_preferred(candidates)
 
     def _fill_backup_pool_checked(self):
-        """Пополняет backup_pool ЖИВЫМИ ссылками (с двойной проверкой)."""
         with self.pool_lock:
             current_size = len(self.backup_pool)
         need = BACKUP_POOL_SIZE - current_size
@@ -389,7 +380,7 @@ class VlessObserver:
                 continue
 
             logger.info(f"🔎 Проверяем кандидата [{checked}]: {display} "
-                        f"({BACKUP_CHECK_ATTEMPTS} проверок, интервал {BACKUP_CHECK_INTERVAL}с)...")
+                        f"({BACKUP_CHECK_ATTEMPTS} проверок, интервал 2с)...")
 
             is_working, ping = test_link_double_check(
                 link,
@@ -418,7 +409,6 @@ class VlessObserver:
             logger.warning(f"⚠️ Не удалось пополнить резерв (проверено кандидатов: {checked})")
 
     def _fill_backup_pool_startup(self):
-        """Пополняет backup_pool при СТАРТЕ (с двойной проверкой)."""
         with self.pool_lock:
             current_size = len(self.backup_pool)
         need = BACKUP_POOL_SIZE - current_size
@@ -461,7 +451,7 @@ class VlessObserver:
                 continue
 
             logger.info(f"🔎 Резерв [{added + 1}/{BACKUP_POOL_SIZE}] проверяем {display} "
-                        f"({BACKUP_CHECK_ATTEMPTS} проверок, интервал {BACKUP_CHECK_INTERVAL}с)...")
+                        f"({BACKUP_CHECK_ATTEMPTS} проверок, интервал 2с)...")
 
             is_working, ping = test_link_double_check(
                 link,
@@ -865,16 +855,36 @@ class VlessObserver:
                     logger.warning(f"❌ Отложенная ссылка {display} всё ещё мертва ({total_elapsed_min} мин в deferred)")
 
     def update_pool_from_file(self):
+        """
+        Перечитывает файл ссылок.
+        При ИЗМЕНЕНИИ файла — сбрасывает dead_links.
+
+        Это нужно, чтобы ссылки, которые ранее были помечены мёртвыми,
+        но чекер их снова нашёл и сохранил — могли быть снова использованы
+        observer'ом (без ожидания рестарта).
+        """
         current_time = time.time()
         if current_time - self.last_pool_update_time < POOL_UPDATE_INTERVAL:
             return
 
         new_links = read_links_file(LINKS_FILE)
         if len(new_links) >= 2:
-            old_count = len(self.links)
-            self.links = new_links
-            if old_count != len(new_links):
-                logger.info(f"📥 Файл перечитан: {old_count} → {len(new_links)} ссылок")
+            old_links_set = set(self.links)
+            new_links_set = set(new_links)
+
+            if old_links_set != new_links_set:
+                logger.info(f"📥 Файл изменился: {len(old_links_set)} → {len(new_links_set)} ссылок")
+
+                # Обновляем список
+                self.links = new_links
+
+                # ФИКС 1.0.10: сбрасываем dead_links при изменении файла
+                with self.dead_links_lock:
+                    old_dead_size = len(self.dead_links)
+                    self.dead_links.clear()
+
+                if old_dead_size > 0:
+                    logger.info(f"🗑️ dead_links сброшен ({old_dead_size} ссылок) — чекер обновил файл")
 
         self.last_pool_update_time = current_time
 
@@ -1039,7 +1049,6 @@ class VlessObserver:
             new_primary = backup['link']
             new_display = format_host_with_geo(new_primary)
 
-            # ПРОВЕРКА ПЕРЕД ПЕРЕКЛЮЧЕНИЕМ: убедимся, что ссылка жива прямо сейчас
             logger.info(f"🔎 Проверка перед переключением: {new_display}...")
             is_working, ping, _ = test_link_through_xray(
                 new_primary,
@@ -1133,7 +1142,7 @@ class VlessObserver:
         logger.info(f"Порты: primary={PROXY_PORT_PRIMARY}, backup={PROXY_PORT_BACKUP}, deferred={PROXY_PORT_DEFERRED}")
         logger.info(f"Проверка основной: каждые {CHECK_INTERVAL_PRIMARY}с (timeout {TEST_TIMEOUT}с)")
         logger.info(f"Проверка резерва: каждые {CHECK_INTERVAL_BACKUP}с (timeout {BACKUP_TEST_TIMEOUT}с)")
-        logger.info(f"Двойная проверка резерва: {BACKUP_CHECK_ATTEMPTS} раз, интервал {BACKUP_CHECK_INTERVAL}с")
+        logger.info(f"Двойная проверка резерва: {BACKUP_CHECK_ATTEMPTS} раз, интервал 2с")
         logger.info(f"Проверка перед переключением: включена")
         logger.info(f"Проверка deferred: каждые {CHECK_INTERVAL_DEFERRED}с")
         logger.info(f"Перепроверка отложенных: раз в {DEAD_LINK_RETRY_INTERVAL//60} минут")
