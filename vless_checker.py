@@ -17,6 +17,7 @@ import signal
 import shutil
 import ssl
 import sys
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple, Optional, Dict
 from urllib.parse import unquote
@@ -24,7 +25,7 @@ from urllib.parse import unquote
 from vless_check_config import *
 
 # ============================================================
-# УСТОЙЧИВЫЕ НАСТРОЙКИ ГЕО
+# УСТОЙЧИВЫЕ НАСТРОЙКИ (работают даже без параметров в конфиге)
 # ============================================================
 import vless_check_config as _cfg
 
@@ -32,6 +33,12 @@ GEO_ENABLED       = getattr(_cfg, 'GEO_ENABLED', True)
 GEO_URL           = getattr(_cfg, 'GEO_URL', "https://www.cloudflare.com/cdn-cgi/trace")
 GEO_TIMEOUT       = getattr(_cfg, 'GEO_TIMEOUT', 5)
 GEO_UNKNOWN_MARK  = getattr(_cfg, 'GEO_UNKNOWN_MARK', "UNKNOWN")
+
+# v1.0.11
+TCP_PRECHECK_ENABLED = getattr(_cfg, 'TCP_PRECHECK_ENABLED', True)
+TCP_PRECHECK_TIMEOUT = getattr(_cfg, 'TCP_PRECHECK_TIMEOUT', 3)
+TCP_PRECHECK_MAX_LATENCY_MS = getattr(_cfg, 'TCP_PRECHECK_MAX_LATENCY_MS', 2000)
+SHUFFLE_BEFORE_CHECK = getattr(_cfg, 'SHUFFLE_BEFORE_CHECK', True)
 
 
 # ============================================================
@@ -105,6 +112,10 @@ class VlessChecker:
         self.checked_count = 0
         self.progress_lock = threading.Lock()
         self.total_links = 0
+
+        # Счётчик TCP-отсеянных ссылок
+        self.tcp_filtered_count = 0
+        self.tcp_lock = threading.Lock()
 
     def cleanup(self):
         """Убивает все дочерние Xray-процессы и удаляет temp-директорию."""
@@ -181,15 +192,42 @@ class VlessChecker:
         return links
 
     # --------------------------------------------------------
+    # TCP-ПРЕДПРОВЕРКА (v1.0.11)
+    # --------------------------------------------------------
+
+    def check_tcp_reachable(self, host: str, port: int) -> Tuple[bool, float]:
+        """
+        Быстрая TCP-проверка доступности сервера.
+
+        Возвращает:
+            (True, latency_ms)  — сервер доступен и latency <= MAX
+            (False, latency_ms) — сервер недоступен или latency > MAX
+        """
+        try:
+            start = time.time()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(TCP_PRECHECK_TIMEOUT)
+            result = sock.connect_ex((host, port))
+            elapsed = (time.time() - start) * 1000
+            sock.close()
+
+            if result != 0:
+                return (False, elapsed)
+
+            if elapsed > TCP_PRECHECK_MAX_LATENCY_MS:
+                return (False, elapsed)
+
+            return (True, elapsed)
+
+        except Exception:
+            return (False, 0)
+
+    # --------------------------------------------------------
     # ГЕО
     # --------------------------------------------------------
 
     def get_geo_through_xray(self, proxy_port: int, timeout: int = GEO_TIMEOUT) -> str:
-        """
-        Запрашивает гео через Xray-прокси.
-        Делает HTTP GET к Cloudflare trace через SOCKS5-прокси Xray.
-        В ответе ищет строку "loc=XX".
-        """
+        """Запрашивает гео через Xray-прокси."""
         s = None
         try:
             s = socks.socksocket()
@@ -590,6 +628,40 @@ class VlessChecker:
             config_path = None
 
             try:
+                # === v1.0.11: TCP-ПРЕДПРОВЕРКА ===
+                if TCP_PRECHECK_ENABLED:
+                    params = self.parse_vless_params(link)
+                    host = params.get('host', '')
+                    port_str = params.get('port', '0')
+                    try:
+                        port = int(port_str)
+                    except:
+                        port = 0
+
+                    if host and port > 0:
+                        tcp_ok, latency = self.check_tcp_reachable(host, port)
+
+                        if not tcp_ok:
+                            with self.tcp_lock:
+                                self.tcp_filtered_count += 1
+
+                            with self.threads_lock:
+                                self.active_threads -= 1
+                                self.completed_count += 1
+
+                            with self.progress_lock:
+                                self.checked_count += 1
+                                checked = self.checked_count
+                                found = self.found_count
+
+                            if checked % 10 == 0:
+                                total = self.total_links
+                                percent = (checked / total) * 100 if total > 0 else 0
+                                logger.info(f"📊 Прогресс: проверено {checked}/{total} ({percent:.1f}%), найдено рабочих: {found}")
+
+                            return (link, None, f"TCP_FAIL ({latency:.0f}ms)")
+
+                # === Полная проверка через Xray ===
                 proxy_port = self.get_next_port()
                 config = self._create_xray_config(link, proxy_port)
                 config_path = os.path.join(self.temp_dir, f"config_{hash(link)}_{proxy_port}.json")
@@ -687,11 +759,20 @@ class VlessChecker:
         self.checked_count = 0
         self.total_links = len(links)
 
+        # Сброс счётчика TCP-отсеянных для этой сессии
+        with self.tcp_lock:
+            self.tcp_filtered_count = 0
+
         if not is_existing:
             self.found_count = 0
             self.working_results = []
 
         total = len(links)
+
+        # === v1.0.11: ПЕРЕМЕШИВАНИЕ СПИСКА ===
+        if SHUFFLE_BEFORE_CHECK and total > 1:
+            random.shuffle(links)
+            logger.info(f"🔀 Список перемешан ({total} ссылок) — порядок проверки случайный")
 
         mode_str = "СУЩЕСТВУЮЩИХ" if is_existing else "НОВЫХ"
         logger.info(f"Начало проверки {total} {mode_str} ссылок (HTTPS, {TEST_HOST}, {TEST_METHOD})")
@@ -722,17 +803,20 @@ class VlessChecker:
                     except Exception as e:
                         logger.error(f"Ошибка при получении результата: {e}")
 
-        logger.info(f"Проверка {mode_str} завершена. Найдено {len(results)} рабочих из {self.checked_count}")
+        with self.tcp_lock:
+            tcp_filtered = self.tcp_filtered_count
+
+        logger.info(f"Проверка {mode_str} завершена. "
+                    f"Найдено {len(results)} рабочих из {self.checked_count} "
+                    f"(TCP-отсеяно: {tcp_filtered})")
         return results
 
     def save_working_links(self, all_working_links: List[Tuple[str, float, str]]):
         """
         Сохраняет лучшие ссылки в файл.
 
-        ИЗМЕНЕНИЕ (v1.0.9):
-        Дедупликация теперь по ключу (host, uuid) вместо простого host.
-        Это позволяет сохранять разные ссылки на одном хосте (с разными UUID)
-        как отдельные записи.
+        Дедупликация по ключу (host, uuid) — разные UUID на одном хосте
+        считаются разными ссылками.
         """
         unique_links = {}
         for link, ping, status in all_working_links:
@@ -747,7 +831,6 @@ class VlessChecker:
             params = self.parse_vless_params(link)
             host = params.get('host', '')
 
-            # Извлекаем UUID из ссылки
             link_clean = self.strip_geo_from_link(link)
             try:
                 link_without_protocol = link_clean[8:]
@@ -795,6 +878,9 @@ def main():
     logger.info(f"Режим проверки: {CHECK_MODE}")
     logger.info(f"Метод проверки: {TEST_METHOD}")
     logger.info(f"Гео: {'включено' if GEO_ENABLED else 'выключено'}")
+    logger.info(f"TCP-предпроверка: {'включена' if TCP_PRECHECK_ENABLED else 'выключена'} "
+                f"(max latency {TCP_PRECHECK_MAX_LATENCY_MS}мс, timeout {TCP_PRECHECK_TIMEOUT}с)")
+    logger.info(f"Перемешивание списка: {'включено' if SHUFFLE_BEFORE_CHECK else 'выключено'}")
     logger.info("="*60)
 
     if not os.path.exists(XRAY_PATH):
