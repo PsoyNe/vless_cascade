@@ -25,7 +25,7 @@ from urllib.parse import unquote
 from vless_check_config import *
 
 # ============================================================
-# УСТОЙЧИВЫЕ НАСТРОЙКИ (работают даже без параметров в конфиге)
+# УСТОЙЧИВЫЕ НАСТРОЙКИ
 # ============================================================
 import vless_check_config as _cfg
 
@@ -34,7 +34,6 @@ GEO_URL           = getattr(_cfg, 'GEO_URL', "https://www.cloudflare.com/cdn-cgi
 GEO_TIMEOUT       = getattr(_cfg, 'GEO_TIMEOUT', 5)
 GEO_UNKNOWN_MARK  = getattr(_cfg, 'GEO_UNKNOWN_MARK', "UNKNOWN")
 
-# v1.0.11
 TCP_PRECHECK_ENABLED = getattr(_cfg, 'TCP_PRECHECK_ENABLED', True)
 TCP_PRECHECK_TIMEOUT = getattr(_cfg, 'TCP_PRECHECK_TIMEOUT', 3)
 TCP_PRECHECK_MAX_LATENCY_MS = getattr(_cfg, 'TCP_PRECHECK_MAX_LATENCY_MS', 2000)
@@ -69,7 +68,6 @@ _active_checker = None
 
 
 def _handle_sigterm(signum, frame):
-    """SIGTERM/SIGINT — graceful shutdown + убийство дочерних Xray."""
     logger.warning(f"🛑 Получен сигнал {signum} — завершаем работу...")
     _shutdown_requested.set()
     global _active_checker
@@ -113,12 +111,14 @@ class VlessChecker:
         self.progress_lock = threading.Lock()
         self.total_links = 0
 
-        # Счётчик TCP-отсеянных ссылок
         self.tcp_filtered_count = 0
         self.tcp_lock = threading.Lock()
 
+        # Счётчик ссылок с битым портом (были отфильтрованы)
+        self.bad_port_count = 0
+        self.bad_port_lock = threading.Lock()
+
     def cleanup(self):
-        """Убивает все дочерние Xray-процессы и удаляет temp-директорию."""
         try:
             with self.processes_lock:
                 procs = list(self.processes)
@@ -191,18 +191,7 @@ class VlessChecker:
         links = re.findall(pattern, content)
         return links
 
-    # --------------------------------------------------------
-    # TCP-ПРЕДПРОВЕРКА (v1.0.11)
-    # --------------------------------------------------------
-
     def check_tcp_reachable(self, host: str, port: int) -> Tuple[bool, float]:
-        """
-        Быстрая TCP-проверка доступности сервера.
-
-        Возвращает:
-            (True, latency_ms)  — сервер доступен и latency <= MAX
-            (False, latency_ms) — сервер недоступен или latency > MAX
-        """
         try:
             start = time.time()
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -218,16 +207,10 @@ class VlessChecker:
                 return (False, elapsed)
 
             return (True, elapsed)
-
         except Exception:
             return (False, 0)
 
-    # --------------------------------------------------------
-    # ГЕО
-    # --------------------------------------------------------
-
     def get_geo_through_xray(self, proxy_port: int, timeout: int = GEO_TIMEOUT) -> str:
-        """Запрашивает гео через Xray-прокси."""
         s = None
         try:
             s = socks.socksocket()
@@ -273,7 +256,6 @@ class VlessChecker:
                 return country
 
             return GEO_UNKNOWN_MARK
-
         except Exception:
             return GEO_UNKNOWN_MARK
         finally:
@@ -284,25 +266,20 @@ class VlessChecker:
                     pass
 
     def add_geo_to_link(self, link: str, country: str) -> str:
-        """Добавляет или заменяет #COUNTRY в конце ссылки."""
         if not country:
             country = GEO_UNKNOWN_MARK
-
         if '#' in link:
             base = link.split('#', 1)[0]
         else:
             base = link
-
         return f"{base}#{country}"
 
     def strip_geo_from_link(self, link: str) -> str:
-        """Убирает #COUNTRY из ссылки (для проверки через Xray)."""
         if '#' in link:
             return link.split('#', 1)[0]
         return link
 
     def extract_geo_from_link(self, link: str) -> str:
-        """Извлекает #COUNTRY из ссылки."""
         if '#' not in link:
             return ''
         fragment = link.split('#', 1)[1].strip()
@@ -310,13 +287,14 @@ class VlessChecker:
             return fragment
         return ''
 
-    # --------------------------------------------------------
-    # ПАРСИНГ И КОНФИГ XRAY
-    # --------------------------------------------------------
-
     def parse_vless_params(self, link: str) -> dict:
-        link_clean = self.strip_geo_from_link(link)
+        """
+        Парсит VLESS-ссылку.
 
+        v1.0.12: порт очищается от мусора (например, `25605/` → `25605`).
+        Источник иногда генерирует ссылки с `/` перед `?`.
+        """
+        link_clean = self.strip_geo_from_link(link)
         try:
             link_without_protocol = link_clean[8:]
             if '@' not in link_without_protocol:
@@ -330,6 +308,15 @@ class VlessChecker:
             else:
                 port = rest
                 params_str = ''
+
+            # v1.0.12: чистим порт от мусора (например, `443/` → `443`)
+            port = port.strip()
+            port_match = re.match(r'^(\d+)', port)
+            if port_match:
+                port = port_match.group(1)
+            else:
+                port = '0'
+
             params = {}
             if params_str:
                 if '#' in params_str:
@@ -348,19 +335,15 @@ class VlessChecker:
         security = params.get('security', '').lower()
         if security != 'reality':
             return True, ''
-
         pbk = params.get('pbk', '').strip()
         if not pbk:
             return False, 'пустой publicKey (pbk)'
-
         sid = params.get('sid', '').strip()
         if sid and len(sid) > 16:
             return False, f'подозрительная длина shortId: {len(sid)}'
-
         sni = params.get('sni', '').strip()
         if not sni:
             return False, 'пустой serverName (sni)'
-
         return True, ''
 
     def load_quarantine_links(self) -> set:
@@ -402,33 +385,32 @@ class VlessChecker:
         filtered = []
         seen_hosts = set()
         quarantine = self.load_quarantine_links()
-
         logger.info(f"Режим фильтрации: {FILTER_MODE}")
-
-        stats = {
-            'total': len(links),
-            'quarantine': 0,
-            'no_params': 0,
-            'wrong_security': 0,
-            'wrong_port': 0,
-            'duplicate_host': 0,
-            'invalid_reality': 0,
-            'accepted': 0
-        }
+        stats = {'total': len(links), 'quarantine': 0, 'no_params': 0,
+                 'wrong_security': 0, 'wrong_port': 0, 'duplicate_host': 0,
+                 'invalid_reality': 0, 'bad_port': 0, 'accepted': 0}
 
         for link in links:
             link_base = self.strip_geo_from_link(link)
             if link_base in quarantine:
                 stats['quarantine'] += 1
                 continue
-
             params = self.parse_vless_params(link)
             if not params:
                 stats['no_params'] += 1
                 continue
-
             security = params.get('security', '').lower()
             port = params.get('port', '')
+
+            # v1.0.12: порт после чистки должен быть числом > 0
+            try:
+                port_int = int(port)
+                if port_int <= 0 or port_int > 65535:
+                    stats['bad_port'] += 1
+                    continue
+            except ValueError:
+                stats['bad_port'] += 1
+                continue
 
             if FILTER_MODE == 'reality_443':
                 if security != 'reality':
@@ -450,18 +432,15 @@ class VlessChecker:
             else:
                 logger.error(f"Неверный FILTER_MODE: {FILTER_MODE}")
                 continue
-
             ok, reason = self.validate_reality_params(params)
             if not ok:
                 stats['invalid_reality'] += 1
                 continue
-
             host = params.get('host', '')
             if host in seen_hosts:
                 stats['duplicate_host'] += 1
                 continue
             seen_hosts.add(host)
-
             filtered.append(link)
             stats['accepted'] += 1
 
@@ -471,19 +450,17 @@ class VlessChecker:
         logger.info(f"  Без параметров: {stats['no_params']}")
         logger.info(f"  Неверный security: {stats['wrong_security']}")
         logger.info(f"  Неверный порт: {stats['wrong_port']}")
+        logger.info(f"  Невалидный порт: {stats['bad_port']}")
         logger.info(f"  Невалидный Reality: {stats['invalid_reality']}")
         logger.info(f"  Дубликаты хостов: {stats['duplicate_host']}")
         logger.info(f"  Принято: {stats['accepted']}")
-
         return filtered
 
     def _create_xray_config(self, vless_link: str, proxy_port: int) -> dict:
         link_clean = self.strip_geo_from_link(vless_link)
-
         params = self.parse_vless_params(link_clean)
         if not params or 'host' not in params:
             raise ValueError("Неверный формат vless ссылки")
-
         ok, reason = self.validate_reality_params(params)
         if not ok:
             raise ValueError(f"Невалидная Reality-ссылка: {reason}")
@@ -491,7 +468,10 @@ class VlessChecker:
         link_without_protocol = link_clean[8:]
         uuid = link_without_protocol.split('@')[0]
         host = params['host']
-        port = int(params['port'])
+        try:
+            port = int(params['port'])
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Невалидный порт '{params['port']}': {e}")
 
         reality_settings = {
             "serverName": params.get('sni', host),
@@ -543,21 +523,16 @@ class VlessChecker:
         cmd = [self.xray_path, "-config", config_path]
         env = os.environ.copy()
         env['XRAY_LOCATION_ASSET'] = '/usr/local/share/xray'
-
         process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             preexec_fn=os.setsid if hasattr(os, 'setsid') else None,
             env=env
         )
-
         with self.processes_lock:
             self.processes.append(process)
         return process
 
     def _kill_process(self, process: subprocess.Popen):
-        """Безопасное убийство процесса + удаление из списка."""
         try:
             process.terminate()
             try:
@@ -574,12 +549,10 @@ class VlessChecker:
         start_time = time.time()
         response_size = 0
         s = None
-
         try:
             s = socks.socksocket()
             s.set_proxy(socks.SOCKS5, "127.0.0.1", proxy_port)
             s.settimeout(timeout)
-
             s.connect((TEST_HOST, TEST_PORT))
 
             context = ssl.create_default_context()
@@ -591,7 +564,6 @@ class VlessChecker:
 
             request = f"HEAD {TEST_PATH} HTTP/1.1\r\nHost: {TEST_HOST}\r\nConnection: close\r\n\r\n".encode()
             s.send(request)
-
             response = s.recv(TEST_BUFFER_SIZE)
             response_size = len(response)
             elapsed = (time.time() - start_time) * 1000
@@ -600,7 +572,6 @@ class VlessChecker:
                 return (True, elapsed, response_size)
             else:
                 return (False, elapsed, response_size)
-
         except Exception:
             elapsed = (time.time() - start_time) * 1000
             return (False, elapsed, 0)
@@ -628,7 +599,6 @@ class VlessChecker:
             config_path = None
 
             try:
-                # === v1.0.11: TCP-ПРЕДПРОВЕРКА ===
                 if TCP_PRECHECK_ENABLED:
                     params = self.parse_vless_params(link)
                     host = params.get('host', '')
@@ -661,7 +631,6 @@ class VlessChecker:
 
                             return (link, None, f"TCP_FAIL ({latency:.0f}ms)")
 
-                # === Полная проверка через Xray ===
                 proxy_port = self.get_next_port()
                 config = self._create_xray_config(link, proxy_port)
                 config_path = os.path.join(self.temp_dir, f"config_{hash(link)}_{proxy_port}.json")
@@ -702,7 +671,6 @@ class VlessChecker:
                     country = self.get_geo_through_xray(proxy_port, timeout=GEO_TIMEOUT)
 
                 self._kill_process(process)
-
                 if config_path and os.path.exists(config_path):
                     try:
                         os.remove(config_path)
@@ -717,11 +685,6 @@ class VlessChecker:
                     self.checked_count += 1
                     checked = self.checked_count
                     found = self.found_count
-
-                if checked % 10 == 0:
-                    total = self.total_links
-                    percent = (checked / total) * 100 if total > 0 else 0
-                    logger.info(f"📊 Прогресс: проверено {checked}/{total} ({percent:.1f}%), найдено рабочих: {found}")
 
                 if is_working:
                     with self.found_lock:
@@ -739,15 +702,47 @@ class VlessChecker:
                         link_result = self.strip_geo_from_link(link)
                         geo_suffix = ""
 
+                    if checked % 10 == 0:
+                        total = self.total_links
+                        percent = (checked / total) * 100 if total > 0 else 0
+                        logger.info(f"📊 Прогресс: проверено {checked}/{total} ({percent:.1f}%), найдено рабочих: {found}")
+
                     return (link_result, response_time, f"OK ({resp_size} байт){geo_suffix}")
                 else:
+                    if checked % 10 == 0:
+                        total = self.total_links
+                        percent = (checked / total) * 100 if total > 0 else 0
+                        logger.info(f"📊 Прогресс: проверено {checked}/{total} ({percent:.1f}%), найдено рабочих: {found}")
+
                     return (link, None, "FAIL")
+
             except Exception as e:
+                # v1.0.12: инкрементим checked_count при EXCEPTION
                 if process is not None:
                     self._kill_process(process)
+                if config_path and os.path.exists(config_path):
+                    try:
+                        os.remove(config_path)
+                    except:
+                        pass
+
                 with self.threads_lock:
                     self.active_threads -= 1
                     self.completed_count += 1
+
+                with self.bad_port_lock:
+                    self.bad_port_count += 1
+
+                with self.progress_lock:
+                    self.checked_count += 1
+                    checked = self.checked_count
+                    found = self.found_count
+
+                if checked % 10 == 0:
+                    total = self.total_links
+                    percent = (checked / total) * 100 if total > 0 else 0
+                    logger.info(f"📊 Прогресс: проверено {checked}/{total} ({percent:.1f}%), найдено рабочих: {found}")
+
                 return (link, None, f"ERROR: {str(e)[:50]}")
 
     def check_links_real(self, links: List[str], max_workers: int = STAGE1_MAX_WORKERS,
@@ -759,9 +754,10 @@ class VlessChecker:
         self.checked_count = 0
         self.total_links = len(links)
 
-        # Сброс счётчика TCP-отсеянных для этой сессии
         with self.tcp_lock:
             self.tcp_filtered_count = 0
+        with self.bad_port_lock:
+            self.bad_port_count = 0
 
         if not is_existing:
             self.found_count = 0
@@ -769,7 +765,6 @@ class VlessChecker:
 
         total = len(links)
 
-        # === v1.0.11: ПЕРЕМЕШИВАНИЕ СПИСКА ===
         if SHUFFLE_BEFORE_CHECK and total > 1:
             random.shuffle(links)
             logger.info(f"🔀 Список перемешан ({total} ссылок) — порядок проверки случайный")
@@ -778,7 +773,6 @@ class VlessChecker:
         logger.info(f"Начало проверки {total} {mode_str} ссылок (HTTPS, {TEST_HOST}, {TEST_METHOD})")
 
         results = []
-
         chunk_size = max(max_workers * 4, max_workers)
 
         for chunk_start in range(0, total, chunk_size):
@@ -805,19 +799,16 @@ class VlessChecker:
 
         with self.tcp_lock:
             tcp_filtered = self.tcp_filtered_count
+        with self.bad_port_lock:
+            bad_port = self.bad_port_count
 
         logger.info(f"Проверка {mode_str} завершена. "
-                    f"Найдено {len(results)} рабочих из {self.checked_count} "
-                    f"(TCP-отсеяно: {tcp_filtered})")
+                    f"Найдено {len(results)} рабочих из checked={self.checked_count}/{total} "
+                    f"(TCP-отсеяно: {tcp_filtered}, битый порт: {bad_port})")
+
         return results
 
     def save_working_links(self, all_working_links: List[Tuple[str, float, str]]):
-        """
-        Сохраняет лучшие ссылки в файл.
-
-        Дедупликация по ключу (host, uuid) — разные UUID на одном хосте
-        считаются разными ссылками.
-        """
         unique_links = {}
         for link, ping, status in all_working_links:
             if link not in unique_links:
@@ -825,37 +816,30 @@ class VlessChecker:
             else:
                 unique_links[link] = min(unique_links[link], ping)
 
-        # Дедуп по (host, uuid)
         best_by_key = {}
         for link, ping in unique_links.items():
             params = self.parse_vless_params(link)
             host = params.get('host', '')
-
             link_clean = self.strip_geo_from_link(link)
             try:
                 link_without_protocol = link_clean[8:]
                 uuid = link_without_protocol.split('@')[0]
             except Exception:
                 uuid = ''
-
             key = f"{host}_{uuid}"
-
             if key not in best_by_key or ping < best_by_key[key][1]:
                 best_by_key[key] = (link, ping)
 
         combined = list(best_by_key.values())
         combined.sort(key=lambda x: x[1])
-
         top_30 = combined[:STAGE1_WORKING_COUNT]
 
-        # Атомарная запись через временный файл
         tmp_file = WORKING_LINKS_FILE + ".tmp"
         with open(tmp_file, 'w', encoding='utf-8') as f:
             for link, ping in top_30:
                 f.write(f"{link}\n")
         os.replace(tmp_file, WORKING_LINKS_FILE)
 
-        # Подсчитываем распределение по странам
         country_stats: Dict[str, int] = {}
         for link, _ in top_30:
             country = self.extract_geo_from_link(link) or "NONE"
@@ -863,7 +847,6 @@ class VlessChecker:
 
         logger.info(f"Сохранено {len(top_30)} лучших ссылок в {WORKING_LINKS_FILE}")
         logger.info(f"  Уникальных ключей (host, uuid): {len(best_by_key)}")
-
         if GEO_ENABLED and country_stats:
             stats_str = ", ".join(f"{k}: {v}" for k, v in sorted(country_stats.items()))
             logger.info(f"  Гео распределение: {stats_str}")
