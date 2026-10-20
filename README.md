@@ -299,7 +299,7 @@ wget -qO- https://raw.githubusercontent.com/PsoyNe/vless_cascade/refs/heads/main
 ```bash
 cd /root/vless_checker
 > /var/log/vless_checker.log
-nohup python3 vless_checker.py > /dev/null 2>&1 &
+nohup /usr/bin/flock -n /var/run/vless_checker.lock python3 vless_checker.py > /dev/null 2>&1 &
 tail -f /var/log/vless_checker.log
 ```
 
