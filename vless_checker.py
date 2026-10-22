@@ -39,8 +39,9 @@ TCP_PRECHECK_TIMEOUT = getattr(_cfg, 'TCP_PRECHECK_TIMEOUT', 3)
 TCP_PRECHECK_MAX_LATENCY_MS = getattr(_cfg, 'TCP_PRECHECK_MAX_LATENCY_MS', 2000)
 SHUFFLE_BEFORE_CHECK = getattr(_cfg, 'SHUFFLE_BEFORE_CHECK', True)
 
-# v1.0.13: приоритетный источник
 TARGET_URL = getattr(_cfg, 'TARGET_URL', '') or ''
+FILTER_MODE_TARGET  = getattr(_cfg, 'FILTER_MODE_TARGET', '') or ''
+FILTER_MODE_DEFAULT = getattr(_cfg, 'FILTER_MODE_DEFAULT', '') or ''
 
 
 # ============================================================
@@ -180,14 +181,10 @@ class VlessChecker:
         return False
 
     # --------------------------------------------------------
-    # СКАЧИВАНИЕ СПИСКОВ (v1.0.13)
+    # СКАЧИВАНИЕ СПИСКОВ
     # --------------------------------------------------------
 
     def download_vless_file(self, url: str) -> Optional[str]:
-        """
-        Скачивает файл по URL.
-        Возвращает текст или None при ошибке.
-        """
         headers = {
             'User-Agent': 'Mozilla/5.0 (Linux; Android 11; NanoPi) AppleWebKit/537.36'
         }
@@ -206,13 +203,6 @@ class VlessChecker:
         return links
 
     def download_and_extract(self, url: str, source_name: str) -> Optional[List[str]]:
-        """
-        Скачивает и извлекает ссылки из указанного URL.
-
-        Возвращает:
-            Список ссылок (может быть пустым — если ничего не нашли)
-            None — если скачивание не удалось
-        """
         if not url:
             return None
 
@@ -417,11 +407,21 @@ class VlessChecker:
                 time.sleep(FILE_READ_RETRY_DELAY)
         return existing
 
-    def filter_links(self, links: List[str]) -> List[str]:
+    def filter_links(self, links: List[str], mode: str = None) -> List[str]:
+        """
+        Фильтрует ссылки по режиму.
+
+        Параметры:
+            mode — режим фильтрации ('reality_443' | 'reality' | 'port_443' | 'all').
+                   Если None — используется FILTER_MODE из конфига.
+        """
+        if mode is None:
+            mode = FILTER_MODE
+
         filtered = []
         seen_hosts = set()
         quarantine = self.load_quarantine_links()
-        logger.info(f"Режим фильтрации: {FILTER_MODE}")
+        logger.info(f"Режим фильтрации: {mode}")
         stats = {'total': len(links), 'quarantine': 0, 'no_params': 0,
                  'wrong_security': 0, 'wrong_port': 0, 'duplicate_host': 0,
                  'invalid_reality': 0, 'bad_port': 0, 'accepted': 0}
@@ -447,25 +447,25 @@ class VlessChecker:
                 stats['bad_port'] += 1
                 continue
 
-            if FILTER_MODE == 'reality_443':
+            if mode == 'reality_443':
                 if security != 'reality':
                     stats['wrong_security'] += 1
                     continue
                 if port != '443':
                     stats['wrong_port'] += 1
                     continue
-            elif FILTER_MODE == 'reality':
+            elif mode == 'reality':
                 if security != 'reality':
                     stats['wrong_security'] += 1
                     continue
-            elif FILTER_MODE == 'port_443':
+            elif mode == 'port_443':
                 if port != '443':
                     stats['wrong_port'] += 1
                     continue
-            elif FILTER_MODE == 'all':
+            elif mode == 'all':
                 pass
             else:
-                logger.error(f"Неверный FILTER_MODE: {FILTER_MODE}")
+                logger.error(f"Неверный режим фильтрации: {mode}")
                 continue
             ok, reason = self.validate_reality_params(params)
             if not ok:
@@ -889,9 +889,13 @@ class VlessChecker:
 def main():
     global _active_checker
 
+    # Определяем эффективные режимы фильтрации
+    effective_mode_target  = FILTER_MODE_TARGET  if FILTER_MODE_TARGET  else FILTER_MODE
+    effective_mode_default = FILTER_MODE_DEFAULT if FILTER_MODE_DEFAULT else FILTER_MODE
+
     logger.info("="*60)
     logger.info(f"ЭТАП 1: Сбор {STAGE1_WORKING_COUNT} лучших ссылок")
-    logger.info(f"Режим фильтрации: {FILTER_MODE}")
+    logger.info(f"Режим фильтрации (общий): {FILTER_MODE}")
     logger.info(f"Режим проверки: {CHECK_MODE}")
     logger.info(f"Метод проверки: {TEST_METHOD}")
     logger.info(f"Гео: {'включено' if GEO_ENABLED else 'выключено'}")
@@ -901,9 +905,12 @@ def main():
 
     if TARGET_URL:
         logger.info(f"Приоритетный источник (TARGET_URL): {TARGET_URL}")
+        logger.info(f"   → режим фильтрации для TARGET: {effective_mode_target}")
         logger.info(f"Резервный источник (DEFAULT_URL):   {DEFAULT_URL}")
+        logger.info(f"   → режим фильтрации для DEFAULT: {effective_mode_default}")
     else:
         logger.info(f"Источник: {DEFAULT_URL}")
+        logger.info(f"   → режим фильтрации: {effective_mode_default}")
 
     logger.info("="*60)
 
@@ -937,28 +944,27 @@ def main():
             logger.info("Существующих ссылок нет")
 
         # ============================================================
-        # ШАГ 2 (v1.0.13): проверка новых ссылок
+        # ШАГ 2: проверка новых ссылок
         # Порядок: TARGET_URL → (если не набрали 30) → DEFAULT_URL
         # ============================================================
         if not _shutdown_requested.is_set():
             existing_set = set(existing_links)
-            new_found_count = 0
 
             # --- Попытка 1: TARGET_URL ---
             if TARGET_URL:
                 logger.info("="*60)
                 logger.info("ШАГ 2: Скачивание и проверка ссылок из TARGET_URL")
+                logger.info(f"Режим фильтрации TARGET: {effective_mode_target}")
                 logger.info("="*60)
 
                 target_links = checker.download_and_extract(TARGET_URL, "TARGET_URL")
 
                 if target_links:
-                    # Исключаем существующие
                     target_new = [l for l in target_links if l not in existing_set]
                     logger.info(f"Новых ссылок из TARGET_URL (не из working_links.txt): {len(target_new)}")
 
                     if target_new:
-                        filtered = checker.filter_links(target_new)
+                        filtered = checker.filter_links(target_new, mode=effective_mode_target)
 
                         if filtered:
                             workers = min(STAGE1_MAX_WORKERS, len(filtered))
@@ -970,7 +976,6 @@ def main():
 
                             logger.info(f"Из {len(filtered)} новых ссылок TARGET_URL работают: {len(working)}")
                             all_working_links.extend(working)
-                            new_found_count = len(working)
                         else:
                             logger.info("TARGET_URL: после фильтрации нет ссылок")
                     else:
@@ -978,7 +983,6 @@ def main():
                 else:
                     logger.warning("TARGET_URL недоступен или пуст — переключаемся на DEFAULT_URL")
 
-                # Проверяем, набрали ли 30
                 total_found = len(all_working_links)
                 if total_found >= STAGE1_WORKING_COUNT:
                     logger.info(f"✅ Набрано {total_found} рабочих ссылок из TARGET_URL — DEFAULT_URL не нужен")
@@ -988,12 +992,12 @@ def main():
                     # --- Попытка 2: DEFAULT_URL ---
                     logger.info("="*60)
                     logger.info("ШАГ 2 (продолжение): Скачивание и проверка из DEFAULT_URL")
+                    logger.info(f"Режим фильтрации DEFAULT: {effective_mode_default}")
                     logger.info("="*60)
 
                     default_links = checker.download_and_extract(DEFAULT_URL, "DEFAULT_URL")
 
                     if default_links:
-                        # Исключаем существующие + уже проверенные из TARGET_URL
                         target_set = set(target_links) if target_links else set()
                         default_new = [
                             l for l in default_links
@@ -1002,7 +1006,7 @@ def main():
                         logger.info(f"Новых ссылок из DEFAULT_URL: {len(default_new)}")
 
                         if default_new:
-                            filtered = checker.filter_links(default_new)
+                            filtered = checker.filter_links(default_new, mode=effective_mode_default)
 
                             if filtered:
                                 workers = min(STAGE1_MAX_WORKERS, len(filtered))
@@ -1024,6 +1028,7 @@ def main():
                 # --- TARGET_URL не задан: только DEFAULT_URL ---
                 logger.info("="*60)
                 logger.info("ШАГ 2: Скачивание и проверка новых ссылок из DEFAULT_URL")
+                logger.info(f"Режим фильтрации: {effective_mode_default}")
                 logger.info("="*60)
 
                 default_links = checker.download_and_extract(DEFAULT_URL, "DEFAULT_URL")
@@ -1033,7 +1038,7 @@ def main():
                     logger.info(f"Новых ссылок (не из working_links.txt): {len(default_new)}")
 
                     if default_new:
-                        filtered = checker.filter_links(default_new)
+                        filtered = checker.filter_links(default_new, mode=effective_mode_default)
 
                         if filtered:
                             workers = min(STAGE1_MAX_WORKERS, len(filtered))
