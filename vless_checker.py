@@ -39,6 +39,9 @@ TCP_PRECHECK_TIMEOUT = getattr(_cfg, 'TCP_PRECHECK_TIMEOUT', 3)
 TCP_PRECHECK_MAX_LATENCY_MS = getattr(_cfg, 'TCP_PRECHECK_MAX_LATENCY_MS', 2000)
 SHUFFLE_BEFORE_CHECK = getattr(_cfg, 'SHUFFLE_BEFORE_CHECK', True)
 
+# v1.0.13: приоритетный источник
+TARGET_URL = getattr(_cfg, 'TARGET_URL', '') or ''
+
 
 # ============================================================
 # ЛОГИРОВАНИЕ (ротация)
@@ -114,7 +117,6 @@ class VlessChecker:
         self.tcp_filtered_count = 0
         self.tcp_lock = threading.Lock()
 
-        # Счётчик ссылок с битым портом (были отфильтрованы)
         self.bad_port_count = 0
         self.bad_port_lock = threading.Lock()
 
@@ -177,19 +179,59 @@ class VlessChecker:
             time.sleep(0.05)
         return False
 
-    def download_vless_file(self, url: str) -> str:
+    # --------------------------------------------------------
+    # СКАЧИВАНИЕ СПИСКОВ (v1.0.13)
+    # --------------------------------------------------------
+
+    def download_vless_file(self, url: str) -> Optional[str]:
+        """
+        Скачивает файл по URL.
+        Возвращает текст или None при ошибке.
+        """
         headers = {
             'User-Agent': 'Mozilla/5.0 (Linux; Android 11; NanoPi) AppleWebKit/537.36'
         }
-        response = requests.get(url, timeout=30, headers=headers)
-        response.raise_for_status()
-        response.encoding = 'utf-8'
-        return response.text
+        try:
+            response = requests.get(url, timeout=30, headers=headers)
+            response.raise_for_status()
+            response.encoding = 'utf-8'
+            return response.text
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ Не удалось скачать {url}: {e}")
+            return None
 
     def extract_vless_links(self, content: str) -> List[str]:
         pattern = r'vless://[^\s<>"\']+'
         links = re.findall(pattern, content)
         return links
+
+    def download_and_extract(self, url: str, source_name: str) -> Optional[List[str]]:
+        """
+        Скачивает и извлекает ссылки из указанного URL.
+
+        Возвращает:
+            Список ссылок (может быть пустым — если ничего не нашли)
+            None — если скачивание не удалось
+        """
+        if not url:
+            return None
+
+        logger.info(f"📥 Скачиваем {source_name}: {url}")
+
+        content = self.download_vless_file(url)
+        if content is None:
+            return None
+
+        links = self.extract_vless_links(content)
+        logger.info(f"   {source_name}: найдено {len(links)} ссылок")
+
+        if not links:
+            logger.warning(f"   ⚠️ {source_name} пуст — ссылок не найдено")
+            return []
+
+        return links
+
+    # --------------------------------------------------------
 
     def check_tcp_reachable(self, host: str, port: int) -> Tuple[bool, float]:
         try:
@@ -288,12 +330,6 @@ class VlessChecker:
         return ''
 
     def parse_vless_params(self, link: str) -> dict:
-        """
-        Парсит VLESS-ссылку.
-
-        v1.0.12: порт очищается от мусора (например, `25605/` → `25605`).
-        Источник иногда генерирует ссылки с `/` перед `?`.
-        """
         link_clean = self.strip_geo_from_link(link)
         try:
             link_without_protocol = link_clean[8:]
@@ -402,7 +438,6 @@ class VlessChecker:
             security = params.get('security', '').lower()
             port = params.get('port', '')
 
-            # v1.0.12: порт после чистки должен быть числом > 0
             try:
                 port_int = int(port)
                 if port_int <= 0 or port_int > 65535:
@@ -717,7 +752,6 @@ class VlessChecker:
                     return (link, None, "FAIL")
 
             except Exception as e:
-                # v1.0.12: инкрементим checked_count при EXCEPTION
                 if process is not None:
                     self._kill_process(process)
                 if config_path and os.path.exists(config_path):
@@ -864,6 +898,13 @@ def main():
     logger.info(f"TCP-предпроверка: {'включена' if TCP_PRECHECK_ENABLED else 'выключена'} "
                 f"(max latency {TCP_PRECHECK_MAX_LATENCY_MS}мс, timeout {TCP_PRECHECK_TIMEOUT}с)")
     logger.info(f"Перемешивание списка: {'включено' if SHUFFLE_BEFORE_CHECK else 'выключено'}")
+
+    if TARGET_URL:
+        logger.info(f"Приоритетный источник (TARGET_URL): {TARGET_URL}")
+        logger.info(f"Резервный источник (DEFAULT_URL):   {DEFAULT_URL}")
+    else:
+        logger.info(f"Источник: {DEFAULT_URL}")
+
     logger.info("="*60)
 
     if not os.path.exists(XRAY_PATH):
@@ -895,36 +936,121 @@ def main():
         else:
             logger.info("Существующих ссылок нет")
 
+        # ============================================================
+        # ШАГ 2 (v1.0.13): проверка новых ссылок
+        # Порядок: TARGET_URL → (если не набрали 30) → DEFAULT_URL
+        # ============================================================
         if not _shutdown_requested.is_set():
-            logger.info("="*60)
-            logger.info("ШАГ 2: Скачивание и проверка новых ссылок")
-            logger.info("="*60)
-
-            logger.info("Скачивание и фильтрация ссылок...")
-
-            content = checker.download_vless_file(DEFAULT_URL)
-            all_links = checker.extract_vless_links(content)
-            logger.info(f"Найдено {len(all_links)} ссылок")
-
             existing_set = set(existing_links)
-            new_links = [l for l in all_links if l not in existing_set]
+            new_found_count = 0
 
-            logger.info(f"Новых ссылок (не из working_links.txt): {len(new_links)}")
+            # --- Попытка 1: TARGET_URL ---
+            if TARGET_URL:
+                logger.info("="*60)
+                logger.info("ШАГ 2: Скачивание и проверка ссылок из TARGET_URL")
+                logger.info("="*60)
 
-            filtered_links = checker.filter_links(new_links)
+                target_links = checker.download_and_extract(TARGET_URL, "TARGET_URL")
 
-            if filtered_links:
-                workers = min(STAGE1_MAX_WORKERS, len(filtered_links))
-                new_working = checker.check_links_real(
-                    filtered_links,
-                    max_workers=workers,
-                    is_existing=False
-                )
+                if target_links:
+                    # Исключаем существующие
+                    target_new = [l for l in target_links if l not in existing_set]
+                    logger.info(f"Новых ссылок из TARGET_URL (не из working_links.txt): {len(target_new)}")
 
-                logger.info(f"Из {len(filtered_links)} новых ссылок работают: {len(new_working)}")
-                all_working_links.extend(new_working)
+                    if target_new:
+                        filtered = checker.filter_links(target_new)
+
+                        if filtered:
+                            workers = min(STAGE1_MAX_WORKERS, len(filtered))
+                            working = checker.check_links_real(
+                                filtered,
+                                max_workers=workers,
+                                is_existing=False
+                            )
+
+                            logger.info(f"Из {len(filtered)} новых ссылок TARGET_URL работают: {len(working)}")
+                            all_working_links.extend(working)
+                            new_found_count = len(working)
+                        else:
+                            logger.info("TARGET_URL: после фильтрации нет ссылок")
+                    else:
+                        logger.info("TARGET_URL: все ссылки уже есть в working_links.txt")
+                else:
+                    logger.warning("TARGET_URL недоступен или пуст — переключаемся на DEFAULT_URL")
+
+                # Проверяем, набрали ли 30
+                total_found = len(all_working_links)
+                if total_found >= STAGE1_WORKING_COUNT:
+                    logger.info(f"✅ Набрано {total_found} рабочих ссылок из TARGET_URL — DEFAULT_URL не нужен")
+                else:
+                    logger.info(f"⚠️ Набрано {total_found}/{STAGE1_WORKING_COUNT} — добираем из DEFAULT_URL")
+
+                    # --- Попытка 2: DEFAULT_URL ---
+                    logger.info("="*60)
+                    logger.info("ШАГ 2 (продолжение): Скачивание и проверка из DEFAULT_URL")
+                    logger.info("="*60)
+
+                    default_links = checker.download_and_extract(DEFAULT_URL, "DEFAULT_URL")
+
+                    if default_links:
+                        # Исключаем существующие + уже проверенные из TARGET_URL
+                        target_set = set(target_links) if target_links else set()
+                        default_new = [
+                            l for l in default_links
+                            if l not in existing_set and l not in target_set
+                        ]
+                        logger.info(f"Новых ссылок из DEFAULT_URL: {len(default_new)}")
+
+                        if default_new:
+                            filtered = checker.filter_links(default_new)
+
+                            if filtered:
+                                workers = min(STAGE1_MAX_WORKERS, len(filtered))
+                                working = checker.check_links_real(
+                                    filtered,
+                                    max_workers=workers,
+                                    is_existing=False
+                                )
+
+                                logger.info(f"Из {len(filtered)} новых ссылок DEFAULT_URL работают: {len(working)}")
+                                all_working_links.extend(working)
+                            else:
+                                logger.info("DEFAULT_URL: после фильтрации нет ссылок")
+                        else:
+                            logger.info("DEFAULT_URL: нет новых ссылок")
+                    else:
+                        logger.warning("DEFAULT_URL тоже недоступен — работаем с тем, что есть")
             else:
-                logger.info("Нет новых ссылок для проверки")
+                # --- TARGET_URL не задан: только DEFAULT_URL ---
+                logger.info("="*60)
+                logger.info("ШАГ 2: Скачивание и проверка новых ссылок из DEFAULT_URL")
+                logger.info("="*60)
+
+                default_links = checker.download_and_extract(DEFAULT_URL, "DEFAULT_URL")
+
+                if default_links:
+                    default_new = [l for l in default_links if l not in existing_set]
+                    logger.info(f"Новых ссылок (не из working_links.txt): {len(default_new)}")
+
+                    if default_new:
+                        filtered = checker.filter_links(default_new)
+
+                        if filtered:
+                            workers = min(STAGE1_MAX_WORKERS, len(filtered))
+                            working = checker.check_links_real(
+                                filtered,
+                                max_workers=workers,
+                                is_existing=False
+                            )
+
+                            logger.info(f"Из {len(filtered)} новых ссылок работают: {len(working)}")
+                            all_working_links.extend(working)
+                        else:
+                            logger.info("Нет новых ссылок для проверки")
+                    else:
+                        logger.info("Нет новых ссылок")
+                else:
+                    logger.warning("DEFAULT_URL недоступен")
 
         logger.info("="*60)
         logger.info("ШАГ 3: Объединение и сохранение ТОП-30")
