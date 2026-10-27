@@ -7,7 +7,7 @@
 
 # -------------------- ОБЩИЕ НАСТРОЙКИ --------------------
 XRAY_PATH = "/usr/local/x-ui/bin/xray-linux-arm32"
-DEFAULT_URL = "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/vless_configs.txt"
+DEFAULT_URL = "https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/vless.txt"
 
 # -------------------- ПРИОРИТЕТНЫЙ ИСТОЧНИК (v1.0.13) --------------------
 # Сначала проверяется TARGET_URL. Если он недоступен / пуст / не набрали 30
@@ -15,7 +15,7 @@ DEFAULT_URL = "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/
 #
 # Пустая строка ('') — только DEFAULT_URL (как раньше).
 # Заданная ссылка — сначала TARGET_URL, потом DEFAULT_URL.
-TARGET_URL = ""
+TARGET_URL = "https://raw.githubusercontent.com/PsoyNe/mtproto/refs/heads/main/working.txt"
 
 # -------------------- НАСТРОЙКИ ОТБОРА ССЫЛОК --------------------
 # Режим отбора по умолчанию (для обоих источников, если не заданы
@@ -33,8 +33,8 @@ FILTER_MODE = 'reality'
 # Если пустые строки ('') — используется FILTER_MODE.
 #
 # Режимы: 'reality_443' | 'reality' | 'port_443' | 'all'
-FILTER_MODE_TARGET = ''
-FILTER_MODE_DEFAULT = ''
+FILTER_MODE_TARGET = 'all'
+FILTER_MODE_DEFAULT = 'reality'
 
 # -------------------- НАСТРОЙКИ ПРОВЕРКИ ССЫЛОК --------------------
 # Режим проверки:
