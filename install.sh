@@ -187,6 +187,31 @@ else
 fi
 
 # ============================================================
+# НАСТРОЙКА ЛИМИТОВ ДЛЯ X-UI (УВЕЛИЧЕНИЕ ФАЙЛОВЫХ ДЕСКРИПТОРОВ)
+# ============================================================
+print_header "НАСТРОЙКА ЛИМИТОВ ДЛЯ X-UI"
+
+print_info "Повышаем лимит открытых файлов (LimitNOFILE) для x-ui..."
+mkdir -p /etc/systemd/system/x-ui.service.d
+cat > /etc/systemd/system/x-ui.service.d/limits.conf << 'EOF'
+[Service]
+LimitNOFILE=65535
+EOF
+
+animate_start "systemctl daemon-reload"
+systemctl daemon-reload
+animate_stop
+
+if systemctl is-active --quiet x-ui; then
+    animate_start "systemctl restart x-ui"
+    systemctl restart x-ui
+    animate_stop
+    print_success "Служба x-ui перезапущена с новым лимитом (65535)"
+else
+    print_info "x-ui не запущен, лимиты применятся при следующем запуске."
+fi
+
+# ============================================================
 # ФУНКЦИЯ СКАЧИВАНИЯ
 # ============================================================
 download_file() {
