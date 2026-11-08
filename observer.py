@@ -8,6 +8,7 @@ import signal
 import logging
 import logging.handlers
 import threading
+import json
 from typing import List, Tuple, Optional, Dict
 
 from observer_config import *
@@ -30,7 +31,6 @@ from triggers import (
     check_and_handle,
     cleanup_triggers_on_startup,
 )
-
 
 # ============================================================
 # НАСТРОЙКА ЛОГИРОВАНИЯ
@@ -58,7 +58,6 @@ if sys.stdout.isatty():
     console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S'))
     logger.addHandler(console_handler)
 
-# Логгер для vless_common и triggers — чтобы их сообщения тоже шли сюда
 for mod_name in ('vless_common', 'triggers'):
     mod_logger = logging.getLogger(mod_name)
     mod_logger.setLevel(logging.INFO)
@@ -66,28 +65,23 @@ for mod_name in ('vless_common', 'triggers'):
     if sys.stdout.isatty():
         mod_logger.addHandler(console_handler)
 
-
 # ============================================================
 # ГЛОБАЛЬНЫЙ ФЛАГ ОСТАНОВКИ
 # ============================================================
 _shutdown_requested = threading.Event()
 
-
 def _handle_sigterm(signum, frame):
     logger.info(f"🛑 Получен сигнал {signum} — завершаем работу...")
     _shutdown_requested.set()
 
-
 signal.signal(signal.SIGTERM, _handle_sigterm)
 signal.signal(signal.SIGINT, _handle_sigterm)
-
 
 # ============================================================
 # ПРИОРИТЕТНАЯ СТРАНА
 # ============================================================
 
 def _normalize_preferred_country() -> str:
-    """Возвращает валидный код приоритетной страны или '' (нет приоритета)."""
     raw = getattr(__import__('observer_config'), 'PREFERRED_COUNTRY', '')
     if not raw:
         return ''
@@ -100,14 +94,17 @@ def _normalize_preferred_country() -> str:
     logger.warning(f"⚠️ PREFERRED_COUNTRY='{raw}' — невалидный код страны, приоритет отключён")
     return ''
 
-
 PREFERRED_COUNTRY = _normalize_preferred_country()
 
-# Устойчивое чтение параметров
 import observer_config as _cfg
 
 BACKUP_CHECK_ATTEMPTS = getattr(_cfg, 'BACKUP_CHECK_ATTEMPTS', 2)
 
+# Настройки штрафного списка (только в памяти)
+PENALTY_ENABLED = True
+PENALTY_TIME = 1800             # 30 минут
+PENALTY_MAX_FAILS = 3           # После 3 провалов - в мертвые
+PRIMARY_GRACE_PERIOD = 180      # Если упала в первые 3 минуты - в штраф
 
 # ============================================================
 # ОСНОВНОЙ КЛАСС
@@ -125,6 +122,7 @@ class VlessObserver:
         self.stats_lock = threading.Lock()
         self.dead_links_lock = threading.Lock()
         self.recently_primary_lock = threading.Lock()
+        self.penalty_lock = threading.Lock()
 
         self.primary_stats = {'fail_count': 0, 'success_count': 0}
         self.switch_count = 0
@@ -138,6 +136,8 @@ class VlessObserver:
         self.last_pool_update_time = 0
         self.waiting_for_links = False
 
+        self.primary_start_time = 0
+
         self.trigger_file = "/tmp/vless_observer_trigger"
         self.quarantine_trigger = "/tmp/vless_quarantine_trigger"
         self.deep_check_trigger = "/tmp/vless_deep_check_trigger"
@@ -146,8 +146,52 @@ class VlessObserver:
         self.deferred_links = {}
         self.dead_links = set()
         self.recently_primary = {}
+        
+        # Штрафной список живет только в оперативной памяти
+        self.penalty_links = {}
 
         self.switching = threading.Event()
+
+    # --------------------------------------------------------
+    # Штрафной список (Penalty Box) - в памяти
+    # --------------------------------------------------------
+    def _add_to_penalty(self, link: str):
+        if not PENALTY_ENABLED or not link:
+            return
+            
+        with self.penalty_lock:
+            current_time = time.time()
+            if link in self.penalty_links:
+                self.penalty_links[link]['timestamp'] = current_time
+                self.penalty_links[link]['fails'] += 1
+                fails = self.penalty_links[link]['fails']
+                logger.warning(f"⚠️ Ссылка {format_host_with_geo(link)} снова сдулась! Штраф №{fails}")
+                
+                if fails >= PENALTY_MAX_FAILS:
+                    logger.error(f"💀 Ссылка {format_host_with_geo(link)} провалилась {fails} раза — в мертвые!")
+                    with self.dead_links_lock:
+                        self.dead_links.add(link)
+                    del self.penalty_links[link]
+            else:
+                self.penalty_links[link] = {
+                    'timestamp': current_time,
+                    'fails': 1
+                }
+                logger.warning(f"🚫 Ссылка {format_host_with_geo(link)} не выдержала нагрузки — в штрафной список на 30 мин.")
+
+    def _cleanup_penalty(self):
+        if not PENALTY_ENABLED or not self.penalty_links:
+            return
+        with self.penalty_lock:
+            current_time = time.time()
+            expired = [
+                link for link, data in self.penalty_links.items()
+                if current_time - data['timestamp'] >= PENALTY_TIME
+            ]
+            if expired:
+                for link in expired:
+                    del self.penalty_links[link]
+                logger.info(f"🔓 {len(expired)} ссылок вышли из штрафного списка")
 
     # --------------------------------------------------------
     # Загрузка и инициализация
@@ -293,6 +337,7 @@ class VlessObserver:
             return []
 
         self._cleanup_recently_primary()
+        self._cleanup_penalty()
         quarantine = self.load_quarantine()
 
         with self.primary_lock:
@@ -311,6 +356,9 @@ class VlessObserver:
         with self.recently_primary_lock:
             recent_set = set(self.recently_primary.keys())
 
+        with self.penalty_lock:
+            penalty_set = set(self.penalty_links.keys())
+
         candidates = []
         seen_bases = set()
 
@@ -324,6 +372,8 @@ class VlessObserver:
             if link in deferred_set or link in dead_set:
                 continue
             if link in recent_set:
+                continue
+            if link in penalty_set:
                 continue
             if l_base in quarantine:
                 continue
@@ -488,6 +538,7 @@ class VlessObserver:
 
         with self.primary_lock:
             self.primary = primary
+            self.primary_start_time = time.time()
 
         primary_display = format_host_with_geo(primary)
 
@@ -508,10 +559,13 @@ class VlessObserver:
             deferred_count = len(self.deferred_links)
         with self.dead_links_lock:
             dead_count = len(self.dead_links)
+        with self.penalty_lock:
+            penalty_count = len(self.penalty_links)
 
         logger.info(f"✅ Основная: {primary_display}")
         logger.info(f"✅ Резерв: {alive_count}/{total_backup}")
         logger.info(f"⏸️ В deferred: {deferred_count}")
+        logger.info(f"🚫 В штрафном списке: {penalty_count}")
         logger.info(f"🗑️ Помечено мёртвыми: {dead_count}")
 
         self.last_primary_host = primary_display
@@ -544,6 +598,9 @@ class VlessObserver:
         with self.deferred_lock:
             deferred_count = len(self.deferred_links)
 
+        with self.penalty_lock:
+            penalty_count = len(self.penalty_links)
+
         with self.stats_lock:
             switch_count = self.switch_count
             fail_count = self.primary_stats['fail_count']
@@ -555,6 +612,7 @@ class VlessObserver:
 
         state += f" | резерв: {alive_count}/{total_backup} живых"
         state += f" | отложено: {deferred_count}"
+        state += f" | штраф: {penalty_count}"
         state += f" | перекл: {switch_count}"
 
         if force or state != self.last_state or (current_time - self.last_log_time) >= 60:
@@ -855,14 +913,6 @@ class VlessObserver:
                     logger.warning(f"❌ Отложенная ссылка {display} всё ещё мертва ({total_elapsed_min} мин в deferred)")
 
     def update_pool_from_file(self):
-        """
-        Перечитывает файл ссылок.
-        При ИЗМЕНЕНИИ файла — сбрасывает dead_links.
-
-        Это нужно, чтобы ссылки, которые ранее были помечены мёртвыми,
-        но чекер их снова нашёл и сохранил — могли быть снова использованы
-        observer'ом (без ожидания рестарта).
-        """
         current_time = time.time()
         if current_time - self.last_pool_update_time < POOL_UPDATE_INTERVAL:
             return
@@ -875,10 +925,8 @@ class VlessObserver:
             if old_links_set != new_links_set:
                 logger.info(f"📥 Файл изменился: {len(old_links_set)} → {len(new_links_set)} ссылок")
 
-                # Обновляем список
                 self.links = new_links
 
-                # ФИКС 1.0.10: сбрасываем dead_links при изменении файла
                 with self.dead_links_lock:
                     old_dead_size = len(self.dead_links)
                     self.dead_links.clear()
@@ -1069,15 +1117,23 @@ class VlessObserver:
 
             with self.primary_lock:
                 old_primary = self.primary
+                old_start_time = self.primary_start_time
 
             old_display = format_host_with_geo(old_primary) if old_primary else 'NONE [N/A]'
 
             logger.warning(f"⚠️ ПЕРЕКЛЮЧЕНИЕ: {old_display} → {new_display}")
 
+            # ЛОГИКА ШТРАФНОГО СПИСКА
+            # Проверяем, сколько проработала старая ссылка
+            time_worked = time.time() - old_start_time
+            if old_primary and time_worked < PRIMARY_GRACE_PERIOD:
+                self._add_to_penalty(old_primary)
+
             if update_3xui_outbound(new_primary, OUTBOUND_NAME):
                 if reload_xray():
                     with self.primary_lock:
                         self.primary = new_primary
+                        self.primary_start_time = time.time()
 
                     with self.pool_lock:
                         self.backup_pool = [item for item in self.backup_pool if item['link'] != new_primary]
@@ -1150,6 +1206,7 @@ class VlessObserver:
         logger.info(f"Обновление пула: каждые {CHECK_INTERVAL_POOL_UPDATE}с")
         logger.info(f"Переключение: после {FAILURES_TO_SWITCH} отказов подряд")
         logger.info(f"Защита от круговорота: {RECENTLY_PRIMARY_COOLDOWN}с")
+        logger.info(f"Штрафной список: {PENALTY_TIME//60} мин, бан после {PENALTY_MAX_FAILS} провалов")
 
         if PREFERRED_COUNTRY:
             logger.info(f"⭐ Приоритетная страна: {PREFERRED_COUNTRY}")
